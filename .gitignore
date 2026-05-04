@@ -5,7 +5,9 @@ venv/
 env/
 .venv/
 
-data/
+# Ignore raw and transform data files but keep DVC metadata
+data/raw/*.csv
+data/transform/*.csv
 
 models/*.pkl
 models/*.joblib
