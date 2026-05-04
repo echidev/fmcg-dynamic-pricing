@@ -1,0 +1,6 @@
+outs:
+- md5: f393f7ce05b50c9958398a12f9756188
+  size: 637206120
+  isexec: true
+  hash: md5
+  path: online_retail_daily_product_tabular.csv

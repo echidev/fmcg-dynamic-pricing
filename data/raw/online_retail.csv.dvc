@@ -1,0 +1,6 @@
+outs:
+- md5: b976b68a99a7131a981e285753b68bb6
+  size: 94850204
+  isexec: true
+  hash: md5
+  path: online_retail.csv
