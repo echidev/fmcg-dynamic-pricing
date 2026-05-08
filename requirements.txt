@@ -4,3 +4,8 @@ matplotlib
 seaborn
 dvc
 mlflow
+optuna
+xgboost
+scikit-learn
+lightgbm
+catboost
