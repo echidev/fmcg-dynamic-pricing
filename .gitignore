@@ -5,16 +5,12 @@ venv/
 env/
 .venv/
 
-# Ignore raw and transform data files but keep DVC metadata
-data/raw/*.csv
-data/transform/*.csv
+# Data and model artifacts (track with DVC)
+data/**
+!data/**/*.dvc
 
-models/*.pkl
-models/*.joblib
-models/*.h5
-models/*.pt
-models/*.pth
-# !models/.gitkeep
+models/**
+!models/**/*.dvc
 
 __pycache__/
 *.py[cod]
@@ -36,3 +32,17 @@ logs/
 htmlcov/
 .coverage
 .pytest_cache/
+
+mlruns/
+mlflow.db
+
+catboost_info/
+
+*.csv
+*.parquet
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.ubj

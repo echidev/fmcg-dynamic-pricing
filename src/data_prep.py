@@ -1,3 +1,10 @@
+"""Data cleaning and daily aggregation pipeline for FMCG demand forecasting.
+
+Takes raw transaction data and produces a clean, daily product-level
+dataset. This is the first stage of the pipeline: raw CSV -> cleaned
+daily aggregates -> feature engineering (features.py).
+"""
+
 import argparse
 from pathlib import Path
 
@@ -5,6 +12,21 @@ import pandas as pd
 
 
 def clean_online_retail(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean and validate raw Online Retail transaction data.
+
+    Performs column standardization, type coercion, deduplication, removal
+    of cancelled invoices (prefix ``C``), filtering of non-product stock
+    codes, and exclusion of rows with non-positive quantity or price.
+
+    Args:
+        df: Raw DataFrame with columns ``Invoice``, ``StockCode``,
+            ``Description``, ``Quantity``, ``InvoiceDate``, ``Price``,
+            ``Customer ID``, ``Country``.
+
+    Returns:
+        Cleaned DataFrame with standardised column names, a computed
+        ``revenue`` column, and only valid product transactions.
+    """
     df = df.copy()
 
     df = df.rename(
@@ -68,6 +90,22 @@ def clean_online_retail(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_daily_product_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate cleaned transactions into a daily product-level dataset.
+
+    Groups by stock code and date, computing total demand quantity, total
+    revenue, and the number of unique invoices. A full date range is
+    generated per product so that days with zero demand are explicitly
+    represented rather than missing.
+
+    Args:
+        df: Cleaned DataFrame with ``stock_code``, ``invoice_date``,
+            ``quantity``, ``revenue``, and ``invoice`` columns.
+
+    Returns:
+        DataFrame indexed by ``(stock_code, date)`` with columns
+        ``demand_qty``, ``revenue``, ``num_invoices``. Every product
+        has a row for every day in the global date range.
+    """
     df = df.copy()
     df["date"] = df["invoice_date"].dt.normalize()
 
@@ -95,7 +133,16 @@ def build_daily_product_dataset(df: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-def run_pipeline(input_path: Path, output_path: Path) -> pd.DataFrame:
+def run_data_prep(input_path: Path, output_path: Path) -> pd.DataFrame:
+    """Execute the cleaning and daily-product aggregation pipeline.
+
+    Args:
+        input_path: Path to the raw input CSV file.
+        output_path: Destination path for the daily-product CSV output.
+
+    Returns:
+        The aggregated daily-product DataFrame.
+    """
     df_raw = pd.read_csv(input_path)
     df_clean = clean_online_retail(df_raw)
     daily_product = build_daily_product_dataset(df_clean)
@@ -107,6 +154,11 @@ def run_pipeline(input_path: Path, output_path: Path) -> pd.DataFrame:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the data preparation script.
+
+    Returns:
+        Parsed argument namespace with ``input`` and ``output`` paths.
+    """
     parser = argparse.ArgumentParser(
         description="Clean Online Retail data and build daily product dataset."
     )
@@ -127,4 +179,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    run_pipeline(args.input, args.output)
+    run_data_prep(args.input, args.output)
