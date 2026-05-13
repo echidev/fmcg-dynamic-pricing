@@ -1,179 +1,140 @@
-"""Data cleaning and daily aggregation pipeline for FMCG demand forecasting.
+"""Data preparation — chunked cleaning + daily aggregation (stock_code x country).
 
-Takes raw transaction data and produces a clean, daily product-level
-dataset. This is the first stage of the pipeline: raw CSV -> cleaned
-daily aggregates -> feature engineering (features.py).
+Pipeline tahap 1: raw CSV → daily panel dengan zero‑sale days.
 """
 
 import argparse
+import gc
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
+
+from src.config import (
+    RAW_PATH, DAILY_PATH, CHUNK_SIZE, USECOLS, DTYPES,
+    NON_PRODUCT_CODES, GROUP_COLS, TARGET_COL,
+)
 
 
-def clean_online_retail(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean and validate raw Online Retail transaction data.
-
-    Performs column standardization, type coercion, deduplication, removal
-    of cancelled invoices (prefix ``C``), filtering of non-product stock
-    codes, and exclusion of rows with non-positive quantity or price.
-
-    Args:
-        df: Raw DataFrame with columns ``Invoice``, ``StockCode``,
-            ``Description``, ``Quantity``, ``InvoiceDate``, ``Price``,
-            ``Customer ID``, ``Country``.
-
-    Returns:
-        Cleaned DataFrame with standardised column names, a computed
-        ``revenue`` column, and only valid product transactions.
-    """
-    df = df.copy()
-
-    df = df.rename(
+def preprocess_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Bersihkan satu chunk transaksi."""
+    df = chunk.rename(
         columns={
-            "Invoice": "invoice",
-            "StockCode": "stock_code",
-            "Description": "description",
-            "Quantity": "quantity",
-            "InvoiceDate": "invoice_date",
-            "Price": "price",
-            "Customer ID": "customer_id",
-            "Country": "country",
+            "Invoice": "invoice", "StockCode": "stock_code",
+            "Quantity": "quantity", "InvoiceDate": "invoice_date",
+            "Price": "price", "Country": "country",
         }
-    )
-
+    ).copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"], errors="coerce")
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-
-    df["stock_code"] = df["stock_code"].astype(str).str.strip().str.upper()
-    df["invoice"] = df["invoice"].astype(str).str.strip()
-
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").astype("float32")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").astype("float32")
+    df["stock_code"] = df["stock_code"].astype("string").str.strip().str.upper()
+    df["invoice"] = df["invoice"].astype("string").str.strip()
+    df["country"] = df["country"].astype("string").str.strip()
     df = df.drop_duplicates()
-
     df = df[df["invoice_date"].notna()]
     df = df[df["stock_code"].notna() & (df["stock_code"] != "")]
     df = df[df["invoice"].notna() & (df["invoice"] != "")]
-
     df = df[~df["invoice"].str.startswith("C", na=False)]
-
-    non_product_codes = {
-        "POST",
-        "DOT",
-        "C2",
-        "M",
-        "D",
-        "ADJUST",
-        "ADJUST2",
-        "BANK CHARGES",
-        "AMAZONFEE",
-        "B",
-        "S",
-        "PADS",
-        "TEST001",
-        "TEST002",
-        "GIFT_0001_10",
-        "GIFT_0001_20",
-        "GIFT_0001_30",
-        "GIFT_0001_40",
-        "GIFT_0001_50",
-        "GIFT_0001_70",
-        "GIFT_0001_80",
-    }
-    df = df[~df["stock_code"].isin(non_product_codes)]
-
+    df = df[~df["stock_code"].isin(NON_PRODUCT_CODES)]
     df = df[(df["quantity"] > 0) & (df["price"] > 0)]
-
-    df["revenue"] = df["quantity"] * df["price"]
-
-    return df
-
-
-def build_daily_product_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate cleaned transactions into a daily product-level dataset.
-
-    Groups by stock code and date, computing total demand quantity, total
-    revenue, and the number of unique invoices. A full date range is
-    generated per product so that days with zero demand are explicitly
-    represented rather than missing.
-
-    Args:
-        df: Cleaned DataFrame with ``stock_code``, ``invoice_date``,
-            ``quantity``, ``revenue``, and ``invoice`` columns.
-
-    Returns:
-        DataFrame indexed by ``(stock_code, date)`` with columns
-        ``demand_qty``, ``revenue``, ``num_invoices``. Every product
-        has a row for every day in the global date range.
-    """
-    df = df.copy()
     df["date"] = df["invoice_date"].dt.normalize()
+    df["revenue"] = df["quantity"] * df["price"]
+    df["stock_code"] = df["stock_code"].astype("category")
+    df["country"] = df["country"].astype("category")
+    df["invoice"] = df["invoice"].astype("category")
+    return df[["stock_code", "country", "date", "invoice", "quantity", "price", "revenue"]]
 
-    daily = (
-        df.groupby(["stock_code", "date"], as_index=False)
-        .agg(
+
+def aggregate_daily_from_chunks(path: Path) -> pd.DataFrame:
+    """Baca CSV per‑chunk, agregat harian per (stock_code, country)."""
+    parts = []
+    max_parts = 25
+    for chunk in pd.read_csv(
+        path, usecols=USECOLS, dtype=DTYPES,
+        chunksize=CHUNK_SIZE, low_memory=False,
+    ):
+        cleaned = preprocess_chunk(chunk)
+        daily = cleaned.groupby(
+            GROUP_COLS + ["date"], as_index=False, observed=True
+        ).agg(
             demand_qty=("quantity", "sum"),
             revenue=("revenue", "sum"),
             num_invoices=("invoice", "nunique"),
+            price_mean=("price", "mean"),
         )
+        parts.append(daily)
+        if len(parts) >= max_parts:
+            partial = pd.concat(parts, ignore_index=True)
+            parts = [
+                partial.groupby(GROUP_COLS + ["date"], as_index=False, observed=True)
+                .agg(demand_qty=("demand_qty", "sum"), revenue=("revenue", "sum"),
+                     num_invoices=("num_invoices", "sum"), price_mean=("price_mean", "mean"))
+            ]
+            del partial; gc.collect()
+        del chunk, cleaned, daily; gc.collect()
+    daily_all = pd.concat(parts, ignore_index=True)
+    del parts; gc.collect()
+    daily_all = daily_all.groupby(GROUP_COLS + ["date"], as_index=False, observed=True).agg(
+        demand_qty=("demand_qty", "sum"), revenue=("revenue", "sum"),
+        num_invoices=("num_invoices", "sum"), price_mean=("price_mean", "mean"),
     )
-
-    stock_codes = daily["stock_code"].unique()
-    full_dates = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")
-    full_index = pd.MultiIndex.from_product(
-        [stock_codes, full_dates], names=["stock_code", "date"]
+    daily_all["avg_price"] = np.where(
+        daily_all["demand_qty"] > 0,
+        daily_all["revenue"] / daily_all["demand_qty"],
+        daily_all["price_mean"],
     )
+    daily_all = daily_all.drop(columns=["price_mean"])
+    for c in GROUP_COLS:
+        daily_all[c] = daily_all[c].astype("category")
+    for c in [TARGET_COL, "revenue", "avg_price", "num_invoices"]:
+        daily_all[c] = daily_all[c].astype("float32")
+    return daily_all
 
-    daily = (
-        daily.set_index(["stock_code", "date"])
-        .reindex(full_index, fill_value=0)
-        .reset_index()
+
+def build_full_panel(df: pd.DataFrame) -> pd.DataFrame:
+    """Isi zero‑sale days dengan resample harian per item."""
+    df = df.sort_values(GROUP_COLS + ["date"]).reset_index(drop=True)
+    def _resample(group: pd.DataFrame) -> pd.DataFrame:
+        group = group.set_index("date").asfreq("D")
+        for c in GROUP_COLS:
+            group[c] = group[c].iloc[0]
+        return group.reset_index()
+
+    panel = df.groupby(GROUP_COLS, group_keys=False, sort=False).apply(_resample)
+    panel = panel.reset_index(drop=True)
+    for c in [TARGET_COL, "revenue", "num_invoices"]:
+        panel[c] = panel[c].fillna(0)
+    panel["avg_price"] = panel["avg_price"].astype("float32")
+    panel["avg_price"] = (
+        panel.groupby(GROUP_COLS, sort=False)["avg_price"]
+        .ffill().bfill().fillna(0)
     )
-
-    return daily
+    for c in GROUP_COLS:
+        panel[c] = panel[c].astype("category")
+    for c in [TARGET_COL, "revenue", "avg_price", "num_invoices"]:
+        panel[c] = panel[c].astype("float32")
+    return panel
 
 
 def run_data_prep(input_path: Path, output_path: Path) -> pd.DataFrame:
-    """Execute the cleaning and daily-product aggregation pipeline.
-
-    Args:
-        input_path: Path to the raw input CSV file.
-        output_path: Destination path for the daily-product CSV output.
-
-    Returns:
-        The aggregated daily-product DataFrame.
-    """
-    df_raw = pd.read_csv(input_path)
-    df_clean = clean_online_retail(df_raw)
-    daily_product = build_daily_product_dataset(df_clean)
-
+    """Eksekusi pipeline: raw → daily → panel → CSV."""
+    daily = aggregate_daily_from_chunks(input_path)
+    panel = build_full_panel(daily)
+    del daily; gc.collect()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    daily_product.to_csv(output_path, index=False)
-
-    return daily_product
+    panel.to_parquet(output_path.with_suffix(".parquet"), index=False)
+    panel.to_csv(output_path, index=False)
+    print(f"Panel written: {panel.shape}")
+    return panel
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the data preparation script.
-
-    Returns:
-        Parsed argument namespace with ``input`` and ``output`` paths.
-    """
     parser = argparse.ArgumentParser(
-        description="Clean Online Retail data and build daily product dataset."
+        description="Data preparation: chunked cleaning + daily panel"
     )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=Path("data/raw/online_retail.csv"),
-        help="Path to raw input CSV",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/transform/online_retail_daily_product.csv"),
-        help="Path to output CSV (daily product dataset)",
-    )
+    parser.add_argument("--input", type=Path, default=RAW_PATH)
+    parser.add_argument("--output", type=Path, default=DAILY_PATH)
     return parser.parse_args()
 
 
