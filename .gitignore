@@ -33,6 +33,8 @@ htmlcov/
 .coverage
 .pytest_cache/
 
+.pre-commit-config.yaml
+
 mlruns/
 mlflow.db
 
