@@ -1,8 +1,5 @@
 [core]
     remote = myremote
-['remote "storage"']
-    url = s3://dvc-demand-forecast-429321094404-ap-southeast-2-an
-    region = ap-southeast-2
-['remote "myremote"']
-    url = s3://dvc-demand-forecast/storage
+[remote "myremote"]
+    url = s3://dvc-demand-forecast-429321094404-ap-southeast-2-an/storage
     region = ap-southeast-2
