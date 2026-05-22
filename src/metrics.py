@@ -1,10 +1,11 @@
 """Enterprise-grade evaluation metrics + lowercase aliases untuk notebook compatibility."""
 
 from __future__ import annotations
+
 from typing import Dict, Optional, Sequence, Union
 
 import numpy as np
-from sklearn.metrics import mean_absolute_error, f1_score, precision_score, recall_score
+from sklearn.metrics import f1_score, mean_absolute_error, precision_score, recall_score
 
 ArrayLike = Union[Sequence[float], np.ndarray]
 

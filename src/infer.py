@@ -1,94 +1,140 @@
-"""Inference — load trained TwinXGBBoosted model and predict.
+"""Inference — load trained DecoupledActuarialXGB model and predict.
 
 Usage:
-    python -m src.infer --input data/raw/new_data.csv --output predictions.csv
+    python -m src.infer --input data/transform/new_data.parquet --output predictions.csv
 """
 
-import argparse, json
+import argparse
+import gc
+import json
+import logging
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.calibration import CalibratedClassifierCV
 
-from src.config import FEATURE_COLS, GROUP_COLS, TARGET_COL, PRICE_COL, MODELS_DIR
+from src.config import FEATURE_COLS, MODELS_DIR, PRICE_COL
 
 
-def load_model(model_dir: Path):
-    """Load sub‑models dan config dari direktori."""
-    clf = xgb.XGBClassifier()
-    clf.load_model(str(model_dir / "clf.json"))
-    reg_top = xgb.XGBRegressor()
-    reg_top.load_model(str(model_dir / "reg_top.json"))
-    reg_peak = xgb.XGBRegressor()
-    reg_peak.load_model(str(model_dir / "reg_peak.json"))
-    reg_tail = xgb.XGBRegressor()
-    reg_tail.load_model(str(model_dir / "reg_tail.json"))
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("infer")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
+def load_model(model_dir: Path) -> dict:
+    """Load sub-models dan config dari direktori."""
+    mean_model = xgb.XGBRegressor()
+    mean_model.load_model(str(model_dir / "mean_model.json"))
+
+    quant_model = xgb.XGBRegressor()
+    quant_model.load_model(str(model_dir / "quant_model.json"))
 
     with open(model_dir / "model_config.json") as f:
         config = json.load(f)
 
-    top_keys = {tuple(k) if isinstance(k, list) else k for k in config.get("top_keys", [])}
-    use_log = config.get("use_log_target", True)
+    return {
+        "mean_model": mean_model,
+        "quant_model": quant_model,
+        "config": config,
+    }
 
-    return {"clf": clf, "reg_top": reg_top, "reg_peak": reg_peak,
-            "reg_tail": reg_tail, "top_keys": top_keys, "use_log": use_log}
 
-
-def predict(model_dict, df: pd.DataFrame, peak_mask: np.ndarray) -> np.ndarray:
-    """Predict demand untuk DataFrame baru.
+def predict(model_dict: dict, df: pd.DataFrame) -> np.ndarray:
+    """Predict demand menggunakan Decoupled Actuarial.
 
     Args:
         model_dict: Output dari load_model().
-        df: DataFrame dengan FEATURE_COLS, GROUP_COLS, dan is_peak_day.
-        peak_mask: Boolean array (is_peak_day untuk setiap row).
+        df: DataFrame dengan FEATURE_COLS, GROUP_COLS, PRICE_COL.
 
     Returns:
         Array prediksi demand_qty.
     """
-    X = df[FEATURE_COLS].to_numpy(dtype=np.float32, copy=False)
-    keys = list(zip(df[GROUP_COLS[0]].to_numpy(), df[GROUP_COLS[1]].to_numpy()))
-    vtop = np.array([k in model_dict["top_keys"] for k in keys])
+    X = df[FEATURE_COLS]
+    price = df[PRICE_COL].to_numpy(dtype=np.float32, copy=False)
+
+    config = model_dict["config"]
+    use_log = config.get("use_log_target", True)
 
     def _pred(model, x):
         p = model.predict(x)
-        use_log = model_dict["use_log"]
         return np.maximum(np.expm1(p) if use_log else p, 0)
 
-    p_top = _pred(model_dict["reg_top"], X)
-    p_peak = _pred(model_dict["reg_peak"], X)
-    p_tail = _pred(model_dict["reg_tail"], X)
+    p_mean = _pred(model_dict["mean_model"], X)
+    p_quant = _pred(model_dict["quant_model"], X)
 
-    return np.where(peak_mask, p_peak, np.where(vtop, p_top, p_tail))
+    # Actuarial layer
+    median_price = float(np.median(price[price > 0])) if (price > 0).any() else 1.0
+    item_price = np.where(price > 0, price, median_price)
+
+    margin_ratio_high = config.get("margin_ratio_high", 1.5)
+    margin_ratio_low = config.get("margin_ratio_low", 0.7)
+    margin_ratio = np.where(item_price > median_price, margin_ratio_high, margin_ratio_low)
+    shelf_life_perishable = (item_price < float(np.mean(item_price))).astype(float)
+
+    smm = config.get("shortage_margin_multiplier", 2.2847)
+    shortage_penalty = margin_ratio * (1.0 + 0.3 * shelf_life_perishable) * smm
+
+    spoilage_penalty = 0.5 * shelf_life_perishable
+    max_mr = max(margin_ratio.max(), 1e-8)
+    overstock_cost = (1.0 - margin_ratio / max_mr) * (1.0 + spoilage_penalty)
+
+    total_cost = shortage_penalty + overstock_cost + 1e-8
+    critical_fractile = np.clip(shortage_penalty / total_cost, 0.2, 0.95)
+
+    final_pred = p_mean + (p_quant - p_mean) * critical_fractile
+    final_pred = np.maximum(final_pred, 0)
+
+    return final_pred
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TwinXGBBoosted inference")
-    parser.add_argument("--input", type=str, required=True, help="Input CSV dengan FEATURE_COLS")
+    parser = argparse.ArgumentParser(description="DecoupledActuarialXGB inference")
+    parser.add_argument("--input", type=str, required=True, help="Input Parquet/CSV dengan FEATURE_COLS")
     parser.add_argument("--output", type=str, default="predictions.csv")
-    parser.add_argument("--model-dir", type=str, default=str(MODELS_DIR / "twin_xgb_boosted"))
-    parser.add_argument("--threshold", type=float, default=0.1)
+    parser.add_argument("--model-dir", type=str, default=str(MODELS_DIR / "decoupled_actuarial_xgb"))
+    parser.add_argument("--format", type=str, choices=["csv", "parquet"], default="csv")
     args = parser.parse_args()
 
-    print(f"Loading model from {args.model_dir}")
+    logger = _setup_logger()
+    logger.info("Loading model from %s", args.model_dir)
     model_dict = load_model(Path(args.model_dir))
 
-    print(f"Loading data from {args.input}")
-    df = pd.read_csv(args.input, low_memory=False)
-    peak_mask = df["is_peak_day"].to_numpy(dtype=bool) if "is_peak_day" in df.columns else np.zeros(len(df), dtype=bool)
+    logger.info("Loading data from %s", args.input)
+    input_path = Path(args.input)
+    if input_path.suffix == ".parquet":
+        df = pd.read_parquet(input_path)
+    else:
+        df = pd.read_csv(input_path, low_memory=False)
 
-    print("Predicting...")
-    pred_reg = predict(model_dict, df, peak_mask)
+    logger.info("Data shape: %s", df.shape)
+    logger.info("Predicting...")
 
-    # Apply classification gating
-    X = df[FEATURE_COLS].to_numpy(dtype=np.float32, copy=False)
-    proba = model_dict["clf"].predict_proba(X)[:, 1]
-    pred = pred_reg * (proba >= args.threshold).astype(int)
+    pred = predict(model_dict, df)
 
     df["forecast"] = pred
-    df.to_csv(args.output, index=False)
-    print(f"Predictions saved to {args.output}")
-    print(f"Zero rate: {(pred == 0).mean()*100:.1f}%")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.format == "parquet":
+        df.to_parquet(output_path.with_suffix(".parquet"), index=False)
+        logger.info("Predictions saved to %s", output_path.with_suffix(".parquet"))
+    else:
+        df.to_csv(output_path, index=False)
+        logger.info("Predictions saved to %s", output_path)
+
+    logger.info("Zero rate: %.1f%%", (pred == 0).mean() * 100)
+    logger.info("Mean forecast: %.2f", pred.mean())
+
+    del df, pred
+    gc.collect()
 
 
 if __name__ == "__main__":

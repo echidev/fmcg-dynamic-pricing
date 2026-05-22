@@ -20,30 +20,43 @@ import argparse
 import subprocess
 import sys
 import time
+import logging
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
 
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("pipeline")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
 def log(msg: str):
-    print(f"\n{'=' * 60}")
-    print(f"  {msg}")
-    print(f"{'=' * 60}")
+    logger = _setup_logger()
+    logger.info("%s", msg)
 
 
 def run(cmd: list[str], desc: str, dry_run: bool = False) -> bool:
     """Run a command and return success status."""
+    logger = _setup_logger()
     log(f"[STEP] {desc}")
-    print(f"  $ {' '.join(cmd)}")
+    logger.info("$ %s", " ".join(cmd))
     if dry_run:
-        print("  [DRY-RUN] skipped")
+        logger.info("[DRY-RUN] skipped")
         return True
     t0 = time.time()
     result = subprocess.run(cmd, cwd=ROOT, capture_output=False)
     elapsed = time.time() - t0
     ok = result.returncode == 0
     status = "OK" if ok else f"FAILED (code {result.returncode})"
-    print(f"  [{status}] {elapsed:.1f}s")
+    logger.info("[%s] %.1fs", status, elapsed)
     return ok
 
 
@@ -58,19 +71,18 @@ def main():
     parser.add_argument("--cleanup", action="store_true", help="Remove temporary artifacts")
     args = parser.parse_args()
 
-    print(f"""
-{'█' * 60}
-  FMCG Demand Forecasting Pipeline
-  Trials: {args.trials}  |  Tune: {'skip' if args.skip_tune else 'yes'}
-  Train: {'skip' if args.skip_train else 'yes'}  |  Dry-run: {args.dry_run}
-{'█' * 60}
-""")
+    logger = _setup_logger()
+    logger.info("FMCG Demand Forecasting Pipeline")
+    logger.info("Trials=%s Tune=%s Train=%s Dry-run=%s", args.trials,
+                "skip" if args.skip_tune else "yes",
+                "skip" if args.skip_train else "yes",
+                args.dry_run)
 
     # ── Step 1: Data Preparation ──
     if not run(
-        [sys.executable, "-m", "src.data_prep",
-         "--input", str(ROOT / "data/raw/online_retail.csv"),
-         "--output", str(ROOT / "data/transform/online_retail_daily_product.csv")],
+         [sys.executable, "-m", "src.data_prep",
+          "--input", str(ROOT / "data/raw/online_retail.csv"),
+          "--output", str(ROOT / "data/transform/online_retail_daily_product.csv")],
         "Data Preparation",
         args.dry_run,
     ):
@@ -78,9 +90,9 @@ def main():
 
     # ── Step 2: Feature Engineering ──
     if not run(
-        [sys.executable, "-m", "src.features",
-         "--input", str(ROOT / "data/raw/online_retail.csv"),
-         "--output-tabular", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv")],
+         [sys.executable, "-m", "src.features",
+          "--input", str(ROOT / "data/raw/online_retail.csv"),
+          "--output-tabular", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv")],
         "Feature Engineering (52 fitur)",
         args.dry_run,
     ):
@@ -89,31 +101,20 @@ def main():
     # ── Step 3: Hyperparameter Tuning ──
     if not args.skip_tune:
         ok = run(
-            [sys.executable, "-m", "src.tune",
-             "--trials", str(args.trials),
-             "--tabular-csv", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv")],
+             [sys.executable, "-m", "src.tune",
+              "--trials", str(args.trials),
+              "--tabular-csv", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv")],
             "Hyperparameter Tuning (Optuna)",
             args.dry_run,
         )
 
     # ── Step 4: Production Training ──
     if not args.skip_train:
-        # Auto-detect best run from MLflow
-        if args.dry_run:
-            run_id = "<auto-detected>"
-        else:
-            run_id = _get_best_mlflow_run()
-
-        if run_id is None:
-            print("  [!] No best run found. Training will use default parameters.")
-            run_id = ""
-
         ok = run(
             [sys.executable, "-m", "src.train",
-             "--run-id", str(run_id) if run_id else "",
-             "--tabular-csv", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv"),
-             "--output-dir", str(ROOT / "models/twin_xgb_boosted")],
-            f"Production Training (run_id={run_id or 'default'})",
+             "--tabular-parquet", str(ROOT / "data/transform/online_retail_daily_product_tabular.parquet"),
+             "--output-dir", str(ROOT / "models/decoupled_actuarial_xgb")],
+            "Production Training (best params from experiment)",
             args.dry_run,
         )
 
@@ -122,11 +123,9 @@ def main():
         log("[STEP] Cleanup temporary artifacts")
         for p in Path(ROOT / "data/transform").glob("*.parquet"):
             p.unlink()
-            print(f"  Removed {p.name}")
+            logger.info("Removed %s", p.name)
 
-    print(f"\n{'█' * 60}")
-    print("  Pipeline complete!")
-    print(f"{'█' * 60}\n")
+    logger.info("Pipeline complete")
 
 
 def _get_best_mlflow_run() -> str | None:

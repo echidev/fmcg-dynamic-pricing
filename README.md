@@ -23,6 +23,13 @@ python run_pipeline.py --skip-tune
 python -m pytest tests/ -v
 ```
 
+## Governance & Standards
+
+- **Config-first:** Primary settings live in `configs/pipeline.yaml`. CLI args override defaults.
+- **Data lineage:** Each data/feature stage writes a manifest under `artifacts/manifests/` with hashes and time range.
+- **Logging:** Pipeline uses structured logging (no raw prints) for reproducibility.
+- **CI/CD:** Workflow exists under `.github/workflows/pytest_mlops.yml` but is disabled (`on: []`).
+
 ## Pipeline Flow
 
 ```

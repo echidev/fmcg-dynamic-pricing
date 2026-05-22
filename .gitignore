@@ -1,6 +1,9 @@
 
 .env
 .env.local
+.kaggle/
+.kaggle-outputs/
+kernel-metadata.json
 venv/
 env/
 .venv/
@@ -37,6 +40,7 @@ htmlcov/
 
 mlruns/
 mlflow.db
+artifacts/
 
 catboost_info/
 
