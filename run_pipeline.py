@@ -78,41 +78,41 @@ def main():
                 "skip" if args.skip_train else "yes",
                 args.dry_run)
 
-    # ── Step 1: Data Preparation ──
+    # ── Step 1: Bronze → Silver (raw CSV → daily panel) ──
     if not run(
          [sys.executable, "-m", "src.data_prep",
-          "--input", str(ROOT / "data/raw/online_retail.csv"),
-          "--output", str(ROOT / "data/transform/online_retail_daily_product.csv")],
-        "Data Preparation",
+          "--input", str(ROOT / "data/bronze/online_retail.csv"),
+          "--output", str(ROOT / "data/silver/online_retail_daily_product.parquet")],
+        "Bronze → Silver (data prep)",
         args.dry_run,
     ):
         sys.exit(1)
 
-    # ── Step 2: Feature Engineering ──
+    # ── Step 2: Silver → Gold (daily panel → 52 features) ──
     if not run(
          [sys.executable, "-m", "src.features",
-          "--input", str(ROOT / "data/raw/online_retail.csv"),
-          "--output-tabular", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv")],
-        "Feature Engineering (52 fitur)",
+          "--input", str(ROOT / "data/silver/online_retail_daily_product.parquet"),
+          "--output-tabular", str(ROOT / "data/gold/online_retail_daily_product_tabular.parquet")],
+        "Silver → Gold (feature engineering)",
         args.dry_run,
     ):
         sys.exit(1)
 
     # ── Step 3: Hyperparameter Tuning ──
     if not args.skip_tune:
-        ok = run(
+        run(
              [sys.executable, "-m", "src.tune",
               "--trials", str(args.trials),
-              "--tabular-csv", str(ROOT / "data/transform/online_retail_daily_product_tabular.csv")],
+              "--tabular-parquet", str(ROOT / "data/gold/online_retail_daily_product_tabular.parquet")],
             "Hyperparameter Tuning (Optuna)",
             args.dry_run,
         )
 
     # ── Step 4: Production Training ──
     if not args.skip_train:
-        ok = run(
+        run(
             [sys.executable, "-m", "src.train",
-             "--tabular-parquet", str(ROOT / "data/transform/online_retail_daily_product_tabular.parquet"),
+             "--tabular-parquet", str(ROOT / "data/gold/online_retail_daily_product_tabular.parquet"),
              "--output-dir", str(ROOT / "models/decoupled_actuarial_xgb")],
             "Production Training (best params from experiment)",
             args.dry_run,
@@ -120,10 +120,8 @@ def main():
 
     # ── Cleanup ──
     if args.cleanup:
-        log("[STEP] Cleanup temporary artifacts")
-        for p in Path(ROOT / "data/transform").glob("*.parquet"):
-            p.unlink()
-            logger.info("Removed %s", p.name)
+        log("[STEP] Cleanup temporary artifacts (tidak ada — data dikelola DVC)")
+        logger.info("Data artifacts dikelola oleh DVC. Tidak ada cleanup otomatis.")
 
     logger.info("Pipeline complete")
 

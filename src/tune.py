@@ -8,7 +8,6 @@ Usage:
 import argparse
 import gc
 import logging
-from pathlib import Path
 
 import mlflow
 import numpy as np
@@ -27,7 +26,6 @@ from src.config import (
     PRICE_COL,
     PROMOTION_THRESHOLDS,
     RANDOM_STATE,
-    RAW_PATH,
     TABULAR_PATH,
     TARGET_COL,
 )
@@ -203,7 +201,7 @@ def main():
     parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--tabular-parquet", type=str, default=str(TABULAR_PATH))
     parser.add_argument("--force-preprocess", action="store_true")
-    parser.add_argument("--input", type=str, default=str(RAW_PATH))
+    parser.add_argument("--input", type=str, default="data/bronze/online_retail.csv")
     parser.add_argument("--seed", type=int, default=RANDOM_STATE)
     args = parser.parse_args()
 
@@ -211,14 +209,11 @@ def main():
     logger.info("DecoupledActuarialXGB — Optuna Tuning")
 
     if args.force_preprocess:
-        logger.info("Running preprocessing from raw...")
-        from src.data_prep import aggregate_daily_from_chunks, build_full_panel
-        from src.features import build_tabular_dataframe
-        daily = aggregate_daily_from_chunks(Path(args.input))
-        panel = build_full_panel(daily)
-        del daily
-        gc.collect()
-        panel = build_tabular_dataframe(panel)
+        logger.info("Menjalankan full ETL: bronze -> silver -> gold...")
+        from src.data_prep import process_bronze
+        from src.features import process_silver
+        process_bronze()
+        panel = process_silver()
     else:
         panel = load_data(args.tabular_parquet)
 

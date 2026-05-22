@@ -9,10 +9,15 @@ import yaml
 # ── Paths ──
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "configs/pipeline.yaml"
-RAW_PATH = PROJECT_ROOT / "data/raw/online_retail.csv"
-DAILY_PATH = PROJECT_ROOT / "data/transform/online_retail_daily_product.parquet"
-TABULAR_PATH = PROJECT_ROOT / "data/transform/online_retail_daily_product_tabular.parquet"
-CACHE_DIR = PROJECT_ROOT / "data/cache"
+
+# Medallion Architecture
+BRONZE_DIR = PROJECT_ROOT / "data/bronze"
+SILVER_DIR = PROJECT_ROOT / "data/silver"
+GOLD_DIR = PROJECT_ROOT / "data/gold"
+
+RAW_PATH = BRONZE_DIR / "online_retail.csv"
+DAILY_PATH = SILVER_DIR / "online_retail_daily_product.parquet"
+TABULAR_PATH = GOLD_DIR / "online_retail_daily_product_tabular.parquet"
 MODELS_DIR = PROJECT_ROOT / "models"
 
 # ── Chunked IO ──

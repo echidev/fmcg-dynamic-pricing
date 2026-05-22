@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import gc
 import json
 import logging
 import os
@@ -27,6 +26,7 @@ import numpy as np
 from src.config import (
     DATE_COL,
     FEATURE_COLS,
+    GOLD_DIR,
     GROUP_COLS,
     MIN_OBS,
     MODEL_PARAMS,
@@ -34,7 +34,6 @@ from src.config import (
     PEAK_DAYS_PCT,
     PRICE_COL,
     QUANTILE_Q_TARGET,
-    RAW_PATH,
     SHORTAGE_MARGIN_MULTIPLIER,
     TABULAR_PATH,
     TARGET_COL,
@@ -110,7 +109,7 @@ def train(panel, output_dir: Path, params_override: dict = None):
 def main():
     parser = argparse.ArgumentParser(description="Train DecoupledActuarialXGB final model")
     parser.add_argument("--force-preprocess", action="store_true")
-    parser.add_argument("--input", type=str, default=str(RAW_PATH))
+    parser.add_argument("--input", type=str, default=str(GOLD_DIR / "online_retail_daily_product_tabular.parquet"))
     parser.add_argument("--tabular-parquet", type=str, default=str(TABULAR_PATH))
     parser.add_argument("--output-dir", type=str, default=str(MODELS_DIR / "decoupled_actuarial_xgb"))
     args = parser.parse_args()
@@ -131,16 +130,13 @@ def main():
 
     # Load data
     if args.force_preprocess:
-        logger.info("Menjalankan preprocessing dari raw data...")
-        from src.data_prep import aggregate_daily_from_chunks, build_full_panel
-        from src.features import build_tabular_dataframe
-        daily = aggregate_daily_from_chunks(Path(args.input))
-        panel = build_full_panel(daily)
-        del daily
-        gc.collect()
-        panel = build_tabular_dataframe(panel)
+        logger.info("Menjalankan full ETL: bronze → silver → gold...")
+        from src.data_prep import process_bronze
+        from src.features import process_silver
+        process_bronze()
+        panel = process_silver()
     else:
-        logger.info("Memuat tabular: %s", args.tabular_parquet)
+        logger.info("Memuat gold tabular: %s", args.tabular_parquet)
         import pandas as pd
         panel = pd.read_parquet(args.tabular_parquet)
 

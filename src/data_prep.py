@@ -8,7 +8,6 @@ import gc
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -131,6 +130,41 @@ def build_full_panel(df: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
+def process_bronze(input_path: Path = None, output_path: Path = None) -> pd.DataFrame:
+    """Bronze layer: raw CSV → daily panel → silver (Parquet).
+
+    Membaca CSV dari data/bronze/, membersihkan, membuat daily panel
+    dengan zero-sale days, dan menulis ke data/silver/.
+    """
+    logger = _setup_logger()
+    input_path = input_path or RAW_PATH
+    output_path = output_path or DAILY_PATH
+
+    logger.info("Bronze: membaca raw dari %s", input_path)
+    daily = aggregate_daily_from_chunks(input_path)
+    panel = build_full_panel(daily)
+    del daily
+    gc.collect()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    panel.to_parquet(output_path, index=False)
+    logger.info("Silver: panel ditulis ke %s rows=%s cols=%s",
+                output_path, panel.shape[0], panel.shape[1])
+
+    manifest = {
+        "stage": "bronze",
+        "input": str(input_path),
+        "output": str(output_path),
+        "rows": int(panel.shape[0]),
+        "cols": int(panel.shape[1]),
+        "date_min": str(panel["date"].min()) if "date" in panel.columns else None,
+        "date_max": str(panel["date"].max()) if "date" in panel.columns else None,
+        "created_utc": datetime.utcnow().isoformat(),
+    }
+    _write_manifest(Path("artifacts/manifests"), manifest)
+    return panel
+
+
 def _setup_logger() -> logging.Logger:
     logger = logging.getLogger("data_prep")
     if logger.handlers:
@@ -161,33 +195,8 @@ def _write_manifest(manifest_dir: Path, payload: dict) -> Path:
 
 
 def run_data_prep(input_path: Path, output_path: Path) -> pd.DataFrame:
-    """Eksekusi pipeline: raw -> daily -> panel -> parquet."""
-    logger = _setup_logger()
-    logger.info("Starting data prep")
-    daily = aggregate_daily_from_chunks(input_path)
-    panel = build_full_panel(daily)
-    del daily
-    gc.collect()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    parquet_path = output_path.with_suffix(".parquet")
-    panel.to_parquet(parquet_path, index=False)
-    logger.info("Panel written: %s rows=%s cols=%s", parquet_path, panel.shape[0], panel.shape[1])
-
-    manifest = {
-        "stage": "data_prep",
-        "input_path": str(input_path),
-        "input_sha256": _sha256(input_path) if input_path.exists() else None,
-        "output_path": str(parquet_path),
-        "rows": int(panel.shape[0]),
-        "cols": int(panel.shape[1]),
-        "date_min": str(panel["date"].min()) if "date" in panel.columns else None,
-        "date_max": str(panel["date"].max()) if "date" in panel.columns else None,
-        "python": os.sys.version.split()[0],
-        "created_utc": datetime.utcnow().isoformat(),
-    }
-    manifest_path = _write_manifest(Path("artifacts/manifests"), manifest)
-    logger.info("Manifest written: %s", manifest_path)
-    return panel
+    """Eksekusi pipeline: bronze → silver (daily panel → parquet)."""
+    return process_bronze(input_path=input_path, output_path=output_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -196,7 +205,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", type=Path, default=RAW_PATH)
     parser.add_argument("--output", type=Path, default=DAILY_PATH)
-    parser.add_argument("--output-parquet", type=Path, default=DAILY_PATH.with_suffix(".parquet"))
     return parser.parse_args()
 
 

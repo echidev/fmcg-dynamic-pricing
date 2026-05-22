@@ -9,7 +9,6 @@ import gc
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -25,11 +24,10 @@ from src.config import (
     HOLIDAY_INTENSITY_CAP,
     PEAK_DAYS_PCT,
     PRICE_COL,
-    RAW_PATH,
+    SILVER_DIR,
     TABULAR_PATH,
     TARGET_COL,
 )
-from src.data_prep import aggregate_daily_from_chunks, build_full_panel
 
 # ═══════════════════════════════════════════════════════════════
 #  A. Calendar + Holiday (14 features)
@@ -264,6 +262,40 @@ def add_lag_rolling_features(panel: pd.DataFrame) -> pd.DataFrame:
 #  E. Pipeline orchestrator
 # ═══════════════════════════════════════════════════════════════
 
+def process_silver(input_path: Path = None, output_path: Path = None) -> pd.DataFrame:
+    """Silver layer: daily panel → feature‑engineered tabular → gold (Parquet).
+
+    Membaca panel dari data/silver/, menambahkan 52 fitur,
+    dan menulis tabular ke data/gold/.
+    """
+    logger = _setup_logger()
+    input_path = input_path or SILVER_DIR / "online_retail_daily_product.parquet"
+    output_path = output_path or TABULAR_PATH
+
+    logger.info("Silver: membaca panel dari %s", input_path)
+    panel = pd.read_parquet(input_path)
+    tabular = build_tabular_dataframe(panel)
+    del panel
+    gc.collect()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tabular.to_parquet(output_path, index=False)
+    logger.info("Gold: tabular ditulis ke %s rows=%s cols=%s features=%s",
+                output_path, tabular.shape[0], tabular.shape[1], len(FEATURE_COLS))
+
+    manifest = {
+        "stage": "silver",
+        "input": str(input_path),
+        "output": str(output_path),
+        "rows": int(tabular.shape[0]),
+        "cols": int(tabular.shape[1]),
+        "features": len(FEATURE_COLS),
+        "created_utc": datetime.utcnow().isoformat(),
+    }
+    _write_manifest(Path("artifacts/manifests"), manifest)
+    return tabular
+
+
 def _setup_logger() -> logging.Logger:
     logger = logging.getLogger("features")
     if logger.handlers:
@@ -306,44 +338,16 @@ def build_tabular_dataframe(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_features(input_path: Path, output_path: Path) -> pd.DataFrame:
-    """Full pipeline: raw → panel → tabular → parquet."""
-    logger = _setup_logger()
-    daily = aggregate_daily_from_chunks(input_path)
-    panel = build_full_panel(daily)
-    del daily
-    gc.collect()
-    tabular = build_tabular_dataframe(panel)
-    del panel
-    gc.collect()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    parquet_path = output_path.with_suffix(".parquet")
-    tabular.to_parquet(parquet_path, index=False)
-    logger.info("Tabular written: %s", parquet_path)
-
-    manifest = {
-        "stage": "features",
-        "input_path": str(input_path),
-        "input_sha256": _sha256(input_path) if input_path.exists() else None,
-        "output_path": str(parquet_path),
-        "rows": int(tabular.shape[0]),
-        "cols": int(tabular.shape[1]),
-        "date_min": str(tabular[DATE_COL].min()) if DATE_COL in tabular.columns else None,
-        "date_max": str(tabular[DATE_COL].max()) if DATE_COL in tabular.columns else None,
-        "python": os.sys.version.split()[0],
-        "created_utc": datetime.utcnow().isoformat(),
-    }
-    manifest_path = _write_manifest(Path("artifacts/manifests"), manifest)
-    logger.info("Manifest written: %s", manifest_path)
-    return tabular
+    """Full pipeline: silver → gold (daily panel → feature tabular)."""
+    return process_silver(input_path=input_path, output_path=output_path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Feature engineering: 52 features for FMCG demand forecasting"
     )
-    parser.add_argument("--input", type=Path, default=RAW_PATH)
+    parser.add_argument("--input", type=Path, default=SILVER_DIR / "online_retail_daily_product.parquet")
     parser.add_argument("--output-tabular", type=Path, default=TABULAR_PATH)
-    parser.add_argument("--output-parquet", type=Path, default=TABULAR_PATH.with_suffix(".parquet"))
     return parser.parse_args()
 
 
