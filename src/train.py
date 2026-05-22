@@ -1,8 +1,11 @@
-"""Production training — train DecoupledActuarialXGB final model on full data.
+"""Pelatihan produksi — train DecoupledActuarialXGB final model on full data.
 
 Menggunakan best params dari Optuna tuning:
   learning_rate=0.0339, max_depth=5, subsample=0.82
   q_target=0.9799, shortage_margin_multiplier=2.2847
+
+MLflow Tracking URI dibaca dari environment variable MLFLOW_TRACKING_URI
+via python-dotenv (.env file atau environment variable).
 
 Usage:
     python -m src.train
@@ -14,8 +17,10 @@ import argparse
 import gc
 import json
 import logging
+import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 import mlflow
 import numpy as np
 
@@ -24,8 +29,6 @@ from src.config import (
     FEATURE_COLS,
     GROUP_COLS,
     MIN_OBS,
-    MLFLOW_EXPERIMENT,
-    MLFLOW_TRACKING_URI,
     MODEL_PARAMS,
     MODELS_DIR,
     PEAK_DAYS_PCT,
@@ -84,7 +87,7 @@ def train(panel, output_dir: Path, params_override: dict = None):
     model.fit(x_all, y_all, feature_cols=FEATURE_COLS)
 
     # Evaluate on full data (in-sample sanity check)
-    logger.info("Evaluating on full dataset...")
+    logger.info("Evaluasi pada full dataset...")
     metrics = model.evaluate(x_all, y_all, price_all, keys_all)
     logger.info("  CLS=%.0f  OFR=%.4f  MAE=%.2f", metrics["cls"], metrics["ofr"], metrics["mae"])
 
@@ -100,7 +103,7 @@ def train(panel, output_dir: Path, params_override: dict = None):
     with open(output_dir / "model_config.json", "w") as f:
         json.dump(config, f, default=str, indent=2)
 
-    logger.info("Model saved to %s", output_dir)
+    logger.info("Model disimpan ke %s", output_dir)
     return model, metrics
 
 
@@ -114,9 +117,21 @@ def main():
 
     logger = _setup_logger()
 
+    # ── Load MLflow Tracking URI dari environment variable ──
+    load_dotenv()
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+    if tracking_uri is None:
+        raise ValueError(
+            "Environment variable MLFLOW_TRACKING_URI tidak ditemukan. "
+            "Setel di file .env atau sebagai environment variable sebelum menjalankan script."
+        )
+
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment("FMCG-Actuarial-Optimization")
+
     # Load data
     if args.force_preprocess:
-        logger.info("Running preprocessing from raw...")
+        logger.info("Menjalankan preprocessing dari raw data...")
         from src.data_prep import aggregate_daily_from_chunks, build_full_panel
         from src.features import build_tabular_dataframe
         daily = aggregate_daily_from_chunks(Path(args.input))
@@ -125,7 +140,7 @@ def main():
         gc.collect()
         panel = build_tabular_dataframe(panel)
     else:
-        logger.info("Loading tabular: %s", args.tabular_parquet)
+        logger.info("Memuat tabular: %s", args.tabular_parquet)
         import pandas as pd
         panel = pd.read_parquet(args.tabular_parquet)
 
@@ -138,29 +153,44 @@ def main():
     # Filter low-obs items
     obs = panel.groupby(GROUP_COLS).size()
     panel = panel[panel.set_index(GROUP_COLS).index.isin(obs[obs >= MIN_OBS].index)].copy()
-    logger.info("Panel shape after MIN_OBS filter: %s", panel.shape)
+    logger.info("Panel shape setelah filter MIN_OBS: %s", panel.shape)
 
-    # MLflow logging
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+    # ── MLflow Run ──
+    with mlflow.start_run(run_name="Production_Tuned_Model") as run:
+        model, metrics = train(panel, Path(args.output_dir))
 
-    with mlflow.start_run(run_name="decoupled_actuarial_production_train") as run:
-        _, metrics = train(panel, Path(args.output_dir))
+        # Log parameter pemenang dari Optuna tuning
         mlflow.log_params({
-            "model_params": str(MODEL_PARAMS),
+            "learning_rate": MODEL_PARAMS["learning_rate"],
+            "max_depth": MODEL_PARAMS["max_depth"],
+            "subsample": MODEL_PARAMS["subsample"],
             "q_target": QUANTILE_Q_TARGET,
             "shortage_margin_multiplier": SHORTAGE_MARGIN_MULTIPLIER,
         })
+
+        # Log metrik bisnis final pada validation set
         mlflow.log_metrics({
-            "train_cls": metrics["cls"],
-            "train_ofr": metrics["ofr"],
-            "train_mae": metrics["mae"],
+            "Global_OFR": metrics["ofr"],
+            "Max_CLS": metrics["cls"],
         })
+
+        # Log artifact model XGBoost
+        mlflow.xgboost.log_model(
+            xgb_model=model.model_mean_,
+            artifact_path="mean_model",
+            registered_model_name="FMCG_Actuarial_Demand_Forecaster",
+        )
+        mlflow.xgboost.log_model(
+            xgb_model=model.model_quant_,
+            artifact_path="quant_model",
+            registered_model_name="FMCG_Actuarial_Demand_Forecaster",
+        )
+
         mlflow.set_tag("model", "decoupled-actuarial-xgb")
         mlflow.set_tag("stage", "production")
 
     logger.info("MLflow Run ID: %s", run.info.run_id)
-    logger.info("Training selesai. Model di: %s", args.output_dir)
+    logger.info("Pelatihan selesai. Model di: %s", args.output_dir)
 
 
 if __name__ == "__main__":
