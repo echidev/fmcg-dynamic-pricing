@@ -4,22 +4,32 @@ Tahap 2: daily panel → feature‑engineered tabular DataFrame.
 Semua fitur dirancang leakage‑safe (shift(1) untuk lag/rolling).
 """
 
-import gc
 import argparse
+import gc
+import hashlib
+import json
+import logging
+import os
+from datetime import datetime
 from pathlib import Path
 
+import holidays as hlib
 import numpy as np
 import pandas as pd
-import holidays as hlib
 
 from src.config import (
-    RAW_PATH, TABULAR_PATH, GROUP_COLS, DATE_COL, TARGET_COL, PRICE_COL,
-    COUNTRY_TO_HOLIDAYS, SEASONALITY_FEATURES,
-    HOLIDAY_INTENSITY_FEATURES, TEMPORAL_PEAK_FEATURES, LAG_ROLL_FEATURES,
-    FEATURE_COLS, CHUNK_SIZE, USECOLS, DTYPES, PEAK_DAYS_PCT, RANDOM_STATE,
+    COUNTRY_TO_HOLIDAYS,
+    DATE_COL,
+    FEATURE_COLS,
+    GROUP_COLS,
+    HOLIDAY_INTENSITY_CAP,
+    PEAK_DAYS_PCT,
+    PRICE_COL,
+    RAW_PATH,
+    TABULAR_PATH,
+    TARGET_COL,
 )
 from src.data_prep import aggregate_daily_from_chunks, build_full_panel
-
 
 # ═══════════════════════════════════════════════════════════════
 #  A. Calendar + Holiday (14 features)
@@ -69,7 +79,8 @@ def add_calendar_holiday_features(panel: pd.DataFrame) -> pd.DataFrame:
     )
     pre_df = pre_df.drop_duplicates()
     panel = panel.merge(pre_df, on=["country_code", "date"], how="left", copy=False)
-    del pre_df, pre_rows, hdf, holiday_rows; gc.collect()
+    del pre_df, pre_rows, hdf, holiday_rows
+    gc.collect()
     panel["is_pre_hari_besar"] = panel["is_pre_hari_besar"].fillna(0.0).astype("float32").astype("uint8")
 
     # Calendar
@@ -98,8 +109,9 @@ def add_holiday_intensity_features(panel: pd.DataFrame) -> pd.DataFrame:
     panel = panel.copy()
 
     # 1) Holiday intensity: mean(holiday_demand) / mean(pre_holiday_demand) per country
+    # FIX 2: drop_duplicates dengan subset (country_code, date) agar variasi per tanggal terjaga
     intensity_rows = []
-    hc = panel[panel["is_hari_besar"] == 1][["country_code", TARGET_COL]].drop_duplicates()
+    hc = panel[panel["is_hari_besar"] == 1][["country_code", DATE_COL, TARGET_COL]].drop_duplicates(subset=["country_code", DATE_COL])
     if not hc.empty:
         holiday_demand = hc.groupby("country_code")[TARGET_COL].mean().to_dict()
         pre_holiday_demand = {}
@@ -118,27 +130,48 @@ def add_holiday_intensity_features(panel: pd.DataFrame) -> pd.DataFrame:
     )
     panel = panel.merge(intensity_df, on="country_code", how="left", copy=False)
     panel["holiday_intensity"] = panel["holiday_intensity"].fillna(1.0).astype("float32")
-    del intensity_df, hc; gc.collect()
+
+    # Filter country dengan <5 hari libur: set intensity=1.0
+    hc2 = panel[panel["is_hari_besar"] == 1].groupby("country_code").size()
+    low_holiday = hc2[hc2 < 5].index
+    if len(low_holiday) > 0:
+        panel.loc[panel["country_code"].isin(low_holiday), "holiday_intensity"] = 1.0
+
+    # FIX 2: Cap dinaikkan dari 10.0 ke HOLIDAY_INTENSITY_CAP agar tidak flat
+    panel["holiday_intensity"] = panel["holiday_intensity"].clip(upper=HOLIDAY_INTENSITY_CAP)
+
+    del intensity_df, hc, hc2
+    gc.collect()
 
     # 2) days_to_next_holiday (capped 30)
-    panel = panel.sort_values(["country", DATE_COL]).reset_index(drop=True)
+    panel = panel.sort_values(["country", DATE_COL], kind="mergesort").reset_index(drop=True)
     hdates = (
         panel[panel["is_hari_besar"] == 1][["country", DATE_COL]]
         .drop_duplicates()
-        .sort_values(["country", DATE_COL])
+        .rename(columns={DATE_COL: "next_holiday"})
+        .sort_values(["country", "next_holiday"], kind="mergesort")
     )
-    panel["days_to_next_holiday"] = 30
-    for country in panel["country"].unique():
-        ch = hdates[hdates["country"] == country][DATE_COL].values
-        if len(ch) == 0:
-            continue
-        idxs = np.where((panel["country"] == country).to_numpy())[0]
-        for idx in idxs:
-            d = panel.loc[idx, DATE_COL]
-            future = ch[ch >= d]
-            if len(future) > 0:
-                panel.loc[idx, "days_to_next_holiday"] = min((future[0] - d).days, 30)
-    panel["days_to_next_holiday"] = panel["days_to_next_holiday"].astype("int8")
+    if len(hdates) > 0:
+        parts = []
+        for country, grp in panel.groupby("country", sort=False):
+            hgrp = hdates[hdates["country"] == country]
+            if hgrp.empty:
+                grp["days_to_next_holiday"] = 30
+            else:
+                m = pd.merge_asof(
+                    grp.sort_values(DATE_COL, kind="mergesort"),
+                    hgrp.sort_values("next_holiday", kind="mergesort"),
+                    left_on=DATE_COL,
+                    right_on="next_holiday",
+                    direction="forward",
+                    allow_exact_matches=True,
+                )
+                grp["days_to_next_holiday"] = (m["next_holiday"] - m[DATE_COL]).dt.days
+            parts.append(grp)
+        panel = pd.concat(parts, ignore_index=True)
+    else:
+        panel["days_to_next_holiday"] = 30
+    panel["days_to_next_holiday"] = panel["days_to_next_holiday"].fillna(30).clip(0, 30).astype("int8")
 
     # 3) is_holiday_season (±3 days)
     panel["is_holiday_season"] = (
@@ -222,7 +255,8 @@ def add_lag_rolling_features(panel: pd.DataFrame) -> pd.DataFrame:
         panel[c] = panel[c].replace([np.inf, -np.inf], 0).fillna(0)
     for c in panel.select_dtypes(include=["float64"]).columns:
         panel[c] = panel[c].astype("float32")
-    del s, rm3, rm14, ps, rpm30, rpm14, last_sale; gc.collect()
+    del s, rm3, rm14, ps, rpm30, rpm14, last_sale
+    gc.collect()
     return panel
 
 
@@ -230,28 +264,76 @@ def add_lag_rolling_features(panel: pd.DataFrame) -> pd.DataFrame:
 #  E. Pipeline orchestrator
 # ═══════════════════════════════════════════════════════════════
 
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("features")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
+def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_manifest(manifest_dir: Path, payload: dict) -> Path:
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    out = manifest_dir / f"features_manifest_{ts}.json"
+    with out.open("w") as f:
+        json.dump(payload, f, indent=2)
+    return out
+
+
 def build_tabular_dataframe(panel: pd.DataFrame) -> pd.DataFrame:
     """Gabung semua feature group jadi satu tabular DataFrame."""
-    print(f"Building tabular from panel: {panel.shape}")
+    logger = _setup_logger()
+    logger.info("Building tabular from panel: rows=%s cols=%s", panel.shape[0], panel.shape[1])
     panel = add_calendar_holiday_features(panel)
     panel = add_holiday_intensity_features(panel)
     panel = add_peak_days(panel)
     panel = add_lag_rolling_features(panel)
-    print(f"Tabular complete: {panel.shape}, features: {len(FEATURE_COLS)}")
+    logger.info("Tabular complete: rows=%s cols=%s features=%s", panel.shape[0], panel.shape[1], len(FEATURE_COLS))
     return panel
 
 
 def run_features(input_path: Path, output_path: Path) -> pd.DataFrame:
-    """Full pipeline: raw → panel → tabular → CSV."""
+    """Full pipeline: raw → panel → tabular → parquet."""
+    logger = _setup_logger()
     daily = aggregate_daily_from_chunks(input_path)
     panel = build_full_panel(daily)
-    del daily; gc.collect()
+    del daily
+    gc.collect()
     tabular = build_tabular_dataframe(panel)
-    del panel; gc.collect()
+    del panel
+    gc.collect()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tabular.to_parquet(output_path.with_suffix(".parquet"), index=False)
-    tabular.to_csv(output_path, index=False)
-    print(f"Tabular written: {output_path}")
+    parquet_path = output_path.with_suffix(".parquet")
+    tabular.to_parquet(parquet_path, index=False)
+    logger.info("Tabular written: %s", parquet_path)
+
+    manifest = {
+        "stage": "features",
+        "input_path": str(input_path),
+        "input_sha256": _sha256(input_path) if input_path.exists() else None,
+        "output_path": str(parquet_path),
+        "rows": int(tabular.shape[0]),
+        "cols": int(tabular.shape[1]),
+        "date_min": str(tabular[DATE_COL].min()) if DATE_COL in tabular.columns else None,
+        "date_max": str(tabular[DATE_COL].max()) if DATE_COL in tabular.columns else None,
+        "python": os.sys.version.split()[0],
+        "created_utc": datetime.utcnow().isoformat(),
+    }
+    manifest_path = _write_manifest(Path("artifacts/manifests"), manifest)
+    logger.info("Manifest written: %s", manifest_path)
     return tabular
 
 
@@ -261,6 +343,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", type=Path, default=RAW_PATH)
     parser.add_argument("--output-tabular", type=Path, default=TABULAR_PATH)
+    parser.add_argument("--output-parquet", type=Path, default=TABULAR_PATH.with_suffix(".parquet"))
     return parser.parse_args()
 
 

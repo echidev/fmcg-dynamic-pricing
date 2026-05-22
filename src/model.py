@@ -1,219 +1,214 @@
-"""Model TwinXGBBoosted — 4 sub‑models + segmented prediction + event weighting.
+"""DecoupledActuarialXGB — 3-pronged decoupled architecture.
 
-Digunakan oleh src/tune.py dan src/train.py.
+Step 1: Honest Baseline (reg:squarederror) — unbiased mean estimate.
+Step 2: Risk-Aware Layer (reg:quantileerror) — q_target percentile.
+Step 3: Actuarial Optimization — dynamic critical fractile per SKU.
+
+Menggantikan TwinXGBBoosted sepenuhnya.
 """
 
-from typing import Dict, Optional, Tuple
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
 import xgboost as xgb
-from sklearn.calibration import CalibratedClassifierCV
 
 from src.config import (
-    CLF_PARAMS, REG_PARAMS, ALPHA_UNDER,
-    QUANTILE_Q_TOP, QUANTILE_Q_PEAK,
-    TOP_SEGMENT_PCT, PEAK_DAYS_PCT,
-    SAMPLE_WEIGHT_ALPHA, SAMPLE_WEIGHT_CAP,
-    HOLIDAY_BOOST, PRE_HOLIDAY_BOOST, PEAK_DAYS_BOOST,
-    THRESHOLD_GRID, USE_LOG_TARGET, GROUP_COLS,
-    TARGET_COL, PRICE_COL, DATE_COL,
+    MODEL_PARAMS,
+    QUANTILE_Q_TARGET,
+    RANDOM_STATE,
+    SHORTAGE_MARGIN_MULTIPLIER,
+    USE_LOG_TARGET,
 )
-from src.metrics import asymmetric_obj, evaluate_prediction
+from src.metrics import evaluate_prediction
 
 
-class TwinXGBBoosted:
-    """Twin‑XGB dengan holiday‑aware peak forecasting.
-
-    4 sub‑models:
-    - clf: classifier (zero vs non‑zero)
-    - reg_top: quantile 0.9 untuk item high‑volume
-    - reg_peak: quantile 0.95 untuk peak days
-    - reg_tail: asymmetric loss untuk sisanya
+class DecoupledActuarialXGB:
+    """3-pronged Decoupled Actuarial XGBoost.
 
     Args:
-        clf_params: Parameter untuk XGBClassifier.
-        reg_params: Parameter untuk XGBRegressor.
-        alpha_under: Penalty untuk under‑forecast di tail regressor.
-        quantile_q_peak: Quantile untuk reg_peak.
-        sample_weight_alpha / cap: Parameter formula sample weight.
-        holiday_boost / pre_holiday_boost / peak_days_boost: Event multipliers.
+        model_params: Parameter XGBoost untuk kedua regressor.
+        quantile_q_target: Quantile alpha untuk pinball loss.
+        shortage_margin_multiplier: Faktor pengali Cu untuk mendorong OFR.
+        margin_ratio_high / margin_ratio_low: Margin ratio threshold.
+        use_log_target: Gunakan log1p transform pada target.
+        random_state: Seed.
     """
 
     def __init__(
         self,
-        clf_params: Optional[Dict] = None,
-        reg_params: Optional[Dict] = None,
-        alpha_under: float = ALPHA_UNDER,
-        quantile_q_top: float = QUANTILE_Q_TOP,
-        quantile_q_peak: float = QUANTILE_Q_PEAK,
-        sample_weight_alpha: float = SAMPLE_WEIGHT_ALPHA,
-        sample_weight_cap: float = SAMPLE_WEIGHT_CAP,
-        holiday_boost: float = HOLIDAY_BOOST,
-        pre_holiday_boost: float = PRE_HOLIDAY_BOOST,
-        peak_days_boost: float = PEAK_DAYS_BOOST,
+        model_params: Optional[Dict] = None,
+        quantile_q_target: float = QUANTILE_Q_TARGET,
+        shortage_margin_multiplier: float = SHORTAGE_MARGIN_MULTIPLIER,
+        margin_ratio_high: float = 1.5,
+        margin_ratio_low: float = 0.7,
         use_log_target: bool = USE_LOG_TARGET,
-        threshold_grid: Optional[list] = None,
+        random_state: int = RANDOM_STATE,
     ):
-        self.clf_params = clf_params or CLF_PARAMS
-        self.reg_params = reg_params or REG_PARAMS
-        self.alpha_under = alpha_under
-        self.quantile_q_top = quantile_q_top
-        self.quantile_q_peak = quantile_q_peak
-        self.sample_weight_alpha = sample_weight_alpha
-        self.sample_weight_cap = sample_weight_cap
-        self.holiday_boost = holiday_boost
-        self.pre_holiday_boost = pre_holiday_boost
-        self.peak_days_boost = peak_days_boost
+        self.model_params = dict(model_params or MODEL_PARAMS)
+        self.quantile_q_target = quantile_q_target
+        self.shortage_margin_multiplier = shortage_margin_multiplier
+        self.margin_ratio_high = margin_ratio_high
+        self.margin_ratio_low = margin_ratio_low
         self.use_log_target = use_log_target
-        self.threshold_grid = threshold_grid or THRESHOLD_GRID
+        self.random_state = random_state
         self._fitted = False
 
     def fit(
         self,
-        X_train: np.ndarray,
+        X_train: pd.DataFrame,
         y_train: np.ndarray,
-        holiday_train: np.ndarray,
-        pre_holiday_train: np.ndarray,
-        peak_train: np.ndarray,
-        top_keys_train: set,
-        train_keys: list,
-    ) -> "TwinXGBBoosted":
-        """Train semua sub‑models dengan event‑specific sample weights.
+        feature_cols: Optional[List[str]] = None,
+    ) -> DecoupledActuarialXGB:
+        """Train mean + quantile regressors on non-zero rows.
 
         Args:
-            X_train: Feature matrix (float32).
-            y_train: Target vector (float32).
-            holiday_train: Boolean mask (is_hari_besar).
-            pre_holiday_train: Boolean mask (is_pre_hari_besar).
-            peak_train: Boolean mask (is_peak_day).
-            top_keys_train: Set of (stock_code, country) tuples for top items.
-            train_keys: List of (stock_code, country) per row.
+            X_train: Training features (DataFrame untuk menjaga feature_names).
+            y_train: Training target.
+            feature_cols: Feature column names (default: semua kolom di X_train).
         """
-        # Zero classifier
-        yz = (y_train > 0).astype(int)
-        spw = (len(yz) - yz.sum()) / (yz.sum() + 1e-8)
-        self.clf_ = xgb.XGBClassifier(
-            **self.clf_params, objective="binary:logistic",
-            scale_pos_weight=spw,
-        )
-        self.clf_.fit(X_train, yz)
-        self.calibrator_ = CalibratedClassifierCV(self.clf_, method="isotonic", cv=3)
-        self.calibrator_.fit(X_train, yz)
+        feature_cols = feature_cols or list(X_train.columns)
 
-        # Regressors — only on non‑zero rows
         nz = y_train > 0
-        X_nz = X_train[nz]
+        X_nz = X_train.loc[nz]
         y_nz = y_train[nz]
         y_reg = np.log1p(y_nz) if self.use_log_target else y_nz
-        q95 = np.quantile(y_nz, 0.95) if y_nz.size else 1.0
-        base_w = 1.0 + self.sample_weight_alpha * np.minimum(y_nz / (q95 + 1e-8), self.sample_weight_cap)
-        event_mult = (
-            1.0
-            + self.holiday_boost * holiday_train[nz]
-            + self.pre_holiday_boost * pre_holiday_train[nz]
-            + self.peak_days_boost * peak_train[nz]
-        )
-        sw = base_w * event_mult
 
-        self.reg_top_ = xgb.XGBRegressor(
-            **self.reg_params, objective="reg:quantileerror",
-            quantile_alpha=self.quantile_q_top,
+        # Step 1: Honest Baseline (MSE)
+        self.model_mean_ = xgb.XGBRegressor(
+            **self.model_params,
+            objective="reg:squarederror",
+            feature_names=feature_cols,
         )
-        self.reg_peak_ = xgb.XGBRegressor(
-            **self.reg_params, objective="reg:quantileerror",
-            quantile_alpha=self.quantile_q_peak,
-        )
-        self.reg_tail_ = xgb.XGBRegressor(
-            **self.reg_params, objective=asymmetric_obj(self.alpha_under),
-        )
-        self.reg_top_.fit(X_nz, y_reg, sample_weight=sw)
-        self.reg_peak_.fit(X_nz, y_reg, sample_weight=sw)
-        self.reg_tail_.fit(X_nz, y_reg)
+        self.model_mean_.fit(X_nz, y_reg)
 
-        self.train_keys_ = train_keys
-        self.top_keys_ = top_keys_train
+        # Step 2: Risk-Aware Quantile (Pinball Loss)
+        self.model_quant_ = xgb.XGBRegressor(
+            **self.model_params,
+            objective="reg:quantileerror",
+            quantile_alpha=self.quantile_q_target,
+            feature_names=feature_cols,
+        )
+        self.model_quant_.fit(X_nz, y_reg)
+
+        self.feature_cols_ = feature_cols
         self._fitted = True
         return self
 
-    def predict(
+    def predict_raw(
         self,
-        X_val: np.ndarray,
-        val_keys: list,
-        peak_mask: np.ndarray,
-        holiday_mask: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, float]:
-        """Predict + threshold search.
+        X_val: pd.DataFrame,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return mean and quantile predictions.
 
         Returns:
-            (final_pred, best_threshold).
+            (p_mean, p_quant) — arrays of shape (n,).
         """
         if not self._fitted:
-            raise RuntimeError("Model belum di‑fit.")
+            raise RuntimeError("Model belum di-fit. Panggil .fit() terlebih dahulu.")
 
-        vtop = np.array([k in self.top_keys_ for k in val_keys])
-
-        proba = self.calibrator_.predict_proba(X_val)[:, 1]
-
-        def _pred(model, X):
-            p = model.predict(X)
+        def _pred(model, x):
+            p = model.predict(x)
             return np.maximum(np.expm1(p) if self.use_log_target else p, 0)
 
-        p_top = _pred(self.reg_top_, X_val)
-        p_peak = _pred(self.reg_peak_, X_val)
-        p_tail = _pred(self.reg_tail_, X_val)
+        p_mean = _pred(self.model_mean_, X_val)
+        p_quant = _pred(self.model_quant_, X_val)
+        return p_mean, p_quant
 
-        pred_reg = np.where(peak_mask, p_peak, np.where(vtop, p_top, p_tail))
-
-        # Bias correction for boosted days
-        if holiday_mask is not None and (peak_mask.any() or holiday_mask.any()):
-            boosted = peak_mask | holiday_mask
-            resid = pred_reg[boosted] - X_val[:, 0]  # dummy, harus pakai y_val
-            # NOTE: bias correction membutuhkan y_val; dilakukan di outer function
-
-        best_th = 0.1
-        return pred_reg, proba, best_th
-
-    def predict_with_threshold(
+    def predict_actuarial(
         self,
-        X_val: np.ndarray,
+        X_val: pd.DataFrame,
+        val_price: np.ndarray,
+        val_keys: List[Tuple],
+        return_components: bool = False,
+    ) -> np.ndarray | Tuple[np.ndarray, Dict]:
+        """Compute final actuarial prediction.
+
+        Step 3: Dynamic Critical Fractile per SKU.
+            CF = Cu / (Cu + Co)
+            Cu = margin_ratio * (1 + 0.3 * shelf_life) * shortage_margin_multiplier
+            final = mean + (quant - mean) * CF
+
+        Args:
+            X_val: Validation features (DataFrame).
+            val_price: avg_price per row.
+            val_keys: List of (stock_code, country) tuples.
+            return_components: If True, return (final_pred, dict_of_components).
+
+        Returns:
+            final_pred array, atau (final_pred, components_dict).
+        """
+        p_mean, p_quant = self.predict_raw(X_val)
+
+        # Synthetic metadata per item from training data
+        median_price = float(np.median(val_price[val_price > 0])) if (val_price > 0).any() else 1.0
+        item_price_vl = np.where(val_price > 0, val_price, median_price)
+
+        margin_ratio = np.where(
+            item_price_vl > median_price,
+            self.margin_ratio_high,
+            self.margin_ratio_low,
+        )
+        shelf_life_perishable = (item_price_vl < float(np.mean(item_price_vl))).astype(float)
+
+        # Cu = shortage cost * multiplier
+        shortage_penalty = margin_ratio * (1.0 + 0.3 * shelf_life_perishable)
+        shortage_penalty = shortage_penalty * self.shortage_margin_multiplier
+
+        # Co = overstock cost
+        spoilage_penalty = 0.5 * shelf_life_perishable
+        max_mr = max(margin_ratio.max(), 1e-8)
+        overstock_cost = (1.0 - margin_ratio / max_mr) * (1.0 + spoilage_penalty)
+
+        total_cost = shortage_penalty + overstock_cost + 1e-8
+        critical_fractile = np.clip(shortage_penalty / total_cost, 0.2, 0.95)
+
+        final_pred = p_mean + (p_quant - p_mean) * critical_fractile
+        final_pred = np.maximum(final_pred, 0)
+
+        if return_components:
+            components = {
+                "p_mean": p_mean,
+                "p_quant": p_quant,
+                "margin_ratio": margin_ratio,
+                "shelf_life_perishable": shelf_life_perishable,
+                "shortage_penalty": shortage_penalty,
+                "critical_fractile": critical_fractile,
+            }
+            return final_pred, components
+
+        return final_pred
+
+    def predict(
+        self,
+        X_val: pd.DataFrame,
+        val_price: np.ndarray,
+        val_keys: List[Tuple],
+    ) -> np.ndarray:
+        """Alias untuk predict_actuarial (return final_pred only)."""
+        return self.predict_actuarial(X_val, val_price, val_keys, return_components=False)
+
+    def evaluate(
+        self,
+        X_val: pd.DataFrame,
         y_val: np.ndarray,
-        price_val: np.ndarray,
-        val_keys: list,
-        peak_mask: np.ndarray,
-        holiday_mask: np.ndarray,
-    ) -> Tuple[np.ndarray, Dict, float]:
-        """Cari threshold optimal (CLS) lalu predict final."""
-        pred_reg, proba, _ = self.predict(X_val, val_keys, peak_mask)
-
-        # Bias correction
-        boosted = peak_mask | holiday_mask
-        if boosted.any():
-            resid = pred_reg[boosted] - y_val[boosted]
-            mean_resid = np.mean(resid)
-            if mean_resid < 0:
-                factor = 1.0 - mean_resid / (np.mean(y_val[boosted]) + 1e-8)
-                pred_reg[boosted] = pred_reg[boosted] * max(1.0, factor)
-
-        bm = float(np.mean(np.abs(y_val)))
-        best_th, best_cls, best_m = None, None, None
-        for th in self.threshold_grid:
-            pred = pred_reg * (proba >= th).astype(int)
-            m = evaluate_prediction(y_val, pred, price_val, bm)
-            if best_cls is None or m["cls"] < best_cls:
-                best_cls = m["cls"]; best_th = th; best_m = m
-        pred_final = pred_reg * (proba >= best_th).astype(int)
-        best_m["threshold"] = best_th
-        return pred_final, best_m, best_th
+        val_price: np.ndarray,
+        val_keys: List[Tuple],
+        baseline_mae: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Predict and evaluate metrics."""
+        pred = self.predict(X_val, val_price, val_keys)
+        return evaluate_prediction(y_val, pred, val_price, baseline_mae)
 
     def get_params(self) -> Dict:
         """Return konfigurasi untuk logging / MLflow."""
         return {
-            "alpha_under": self.alpha_under,
-            "quantile_q_top": self.quantile_q_top,
-            "quantile_q_peak": self.quantile_q_peak,
-            "sample_weight_alpha": self.sample_weight_alpha,
-            "sample_weight_cap": self.sample_weight_cap,
-            "holiday_boost": self.holiday_boost,
-            "pre_holiday_boost": self.pre_holiday_boost,
-            "peak_days_boost": self.peak_days_boost,
+            "quantile_q_target": self.quantile_q_target,
+            "shortage_margin_multiplier": self.shortage_margin_multiplier,
+            "model_params": self.model_params,
             "use_log_target": self.use_log_target,
+            "margin_ratio_high": self.margin_ratio_high,
+            "margin_ratio_low": self.margin_ratio_low,
         }

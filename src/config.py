@@ -4,11 +4,15 @@ Single source of truth untuk semua konstanta, parameter, dan feature list.
 
 from pathlib import Path
 
+import yaml
+
 # ── Paths ──
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_ROOT / "configs/pipeline.yaml"
 RAW_PATH = PROJECT_ROOT / "data/raw/online_retail.csv"
-DAILY_PATH = PROJECT_ROOT / "data/transform/online_retail_daily_product.csv"
-TABULAR_PATH = PROJECT_ROOT / "data/transform/online_retail_daily_product_tabular.csv"
+DAILY_PATH = PROJECT_ROOT / "data/transform/online_retail_daily_product.parquet"
+TABULAR_PATH = PROJECT_ROOT / "data/transform/online_retail_daily_product_tabular.parquet"
+CACHE_DIR = PROJECT_ROOT / "data/cache"
 MODELS_DIR = PROJECT_ROOT / "models"
 
 # ── Chunked IO ──
@@ -95,64 +99,57 @@ FEATURE_COLS = (
     + LAG_ROLL_FEATURES
 )
 
-# ── XGBoost classifier params ──
-CLF_PARAMS = {
-    "n_estimators": 300,
-    "max_depth": 5,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "tree_method": "hist",
-    "max_bin": 256,
-    "random_state": 42,
-    "n_jobs": -1,
-}
+# ── Feature index map for audit ──
+FEATURE_INDEX_MAP = {i: name for i, name in enumerate(FEATURE_COLS)}
 
-# ── XGBoost regressor params ──
-REG_PARAMS = {
+# ── Configurable constants ──
+HOLIDAY_INTENSITY_CAP = 100.0
+
+# ── Decoupled Actuarial Architecture params ──
+MODEL_PARAMS = {
     "n_estimators": 400,
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
+    "max_depth": 5,
+    "learning_rate": 0.0339,
+    "subsample": 0.82,
     "colsample_bytree": 0.8,
     "tree_method": "hist",
-    "max_bin": 256,
+    "max_bin": 128,
     "random_state": 42,
     "n_jobs": -1,
 }
 
-# ── Twin-XGB Boosted architecture params ──
-ALPHA_UNDER = 50.0
-QUANTILE_Q = 0.8
-QUANTILE_Q_TOP = 0.9
-QUANTILE_Q_PEAK = 0.95
+QUANTILE_Q_TARGET = 0.9799
+SHORTAGE_MARGIN_MULTIPLIER = 2.2847
 
 # ── Segmentation ──
 TOP_SEGMENT_PCT = 0.05
 PEAK_DAYS_PCT = 0.05
 
-# ── Event-specific weighting ──
-SAMPLE_WEIGHT_ALPHA = 4.0
-SAMPLE_WEIGHT_CAP = 5.0
-HOLIDAY_BOOST = 1.5
-PRE_HOLIDAY_BOOST = 0.5
-PEAK_DAYS_BOOST = 2.0
-
 # ── Threshold grid ──
 THRESHOLD_GRID = [round(x, 2) for x in [i * 0.05 for i in range(2, 19)]]
 
+# ── Config loader ──
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open("r") as f:
+            return yaml.safe_load(f)
+    return {}
+
+
+_CFG = load_config()
+
 # ── Data quality ──
-MIN_OBS = 60  # minimum days per item to include
-RANDOM_STATE = 42
+MIN_OBS = 60
+RANDOM_STATE = int(_CFG.get("random_seed", 42))
 USE_LOG_TARGET = True
 
 # ── MLflow ──
 MLFLOW_TRACKING_URI = "sqlite:///mlruns/mlflow.db"
-MLFLOW_EXPERIMENT = "xgboost_demand_forecasting"
+MLFLOW_EXPERIMENT = str(_CFG.get("mlflow_experiment", "xgboost_demand_forecasting"))
 
 # ── Business thresholds for model promotion ──
 PROMOTION_THRESHOLDS = {
-    "ofr_min": 0.80,
-    "cls_max": 45_000,
-    "peak_ofr_min": 0.75,
+    "ofr_min": float(_CFG.get("promotion_thresholds", {}).get("ofr_min", 0.80)),
+    "cls_max": float(_CFG.get("promotion_thresholds", {}).get("cls_max", 50_000)),
 }

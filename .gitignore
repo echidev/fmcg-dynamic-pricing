@@ -1,6 +1,9 @@
 
 .env
 .env.local
+.kaggle/
+.kaggle-outputs/
+kernel-metadata.json
 venv/
 env/
 .venv/
@@ -35,8 +38,14 @@ htmlcov/
 
 .pre-commit-config.yaml
 
+# Agent instructions (local AI context, not project source)
+AGENTS.md
+SKILLS.md
+RULES.md
+
 mlruns/
 mlflow.db
+artifacts/
 
 catboost_info/
 
