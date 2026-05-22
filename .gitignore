@@ -11,6 +11,7 @@ env/
 # Data and model artifacts (track with DVC)
 data/**
 !data/**/*.dvc
+!data/**/.gitkeep
 
 models/**
 !models/**/*.dvc
