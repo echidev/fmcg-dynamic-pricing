@@ -1,7 +1,7 @@
 """Inference — load trained DecoupledActuarialXGB model and predict.
 
 Usage:
-    python -m src.infer --input data/transform/new_data.parquet --output predictions.csv
+    python -m src.infer --input data/gold/online_retail_daily_product_tabular.parquet --output predictions.csv
 """
 
 import argparse
