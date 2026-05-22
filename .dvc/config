@@ -1,5 +1,5 @@
 [core]
     remote = storage
 ['remote "storage"']
-    url = s3://dvcstore
+    url = s3://dvc-demand-forecast-429321094404-ap-southeast-2-an
     region = ap-southeast-2
