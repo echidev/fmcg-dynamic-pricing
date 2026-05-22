@@ -6,11 +6,16 @@ mlflow>=2.10
 optuna>=3.4
 holidays>=0.40
 matplotlib>=3.8
+pyyaml>=6.0
+pyarrow>=14.0
 
 # Development & testing
 pytest>=8.0
 pytest-cov>=5.0
 nbformat>=5.9
+
+# Linting
+ruff>=0.3
 
 # Data/model versioning (external CLI)
 # dvc>=3.0

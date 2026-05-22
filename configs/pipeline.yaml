@@ -1,0 +1,12 @@
+dataset_version: "online_retail_v1"
+feature_set_id: "fmcg_features_v52"
+cutoff_date: "2011-12-09"
+train_window_days: 730
+valid_window_days: 30
+test_window_days: 30
+random_seed: 42
+model_type: "decoupled_actuarial_xgb"
+mlflow_experiment: "xgboost_demand_forecasting"
+promotion_thresholds:
+  ofr_min: 0.80
+  cls_max: 50000

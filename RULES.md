@@ -41,9 +41,9 @@ As an AI Agent working on this FMCG Dynamic Pricing & Demand Forecasting project
 - **Enterprise Documentation**: Document code clearly and neatly. Use standard docstrings (e.g., Google or NumPy format) for all classes and functions. Keep inline comments concise; focus on explaining the *why* (business logic or architectural decision) rather than stating the obvious *what*.
 
 ## 8. Security, Privacy & Confidentiality
-- **Restricted Access**: You are STRICTLY FORBIDDEN from reading, modifying, exfiltrating, or printing the contents of `.env` files, `.aws/credentials`, or any local configuration files that contain secrets.
+- **Restricted Access**: You are STRICTLY FORBIDDEN from reading, modifying, exfiltrating, or printing the contents of `.env` files, `.kaggle/` (Kaggle API credentials), `.aws/credentials`, or any local configuration files that contain secrets.
 - **Credential Isolation**: NEVER hardcode API keys, database URIs, passwords, or cloud access tokens in any script, notebook, or documentation. All credentials must be loaded dynamically via `os.environ` or a secure secret manager.
-- **Git Ignore Enforcement**: Ensure that `.env`, `*.key`, `*.pem`, `*.sqlite`, and any files containing authentication details are explicitly listed in `.gitignore` before performing any version control operations.
+- **Git Ignore Enforcement**: Ensure that `.env`, `.kaggle/`, `*.key`, `*.pem`, `*.sqlite`, and any files containing authentication details are explicitly listed in `.gitignore` before performing any version control operations.
 - **Data Anonymization & Logging**: Do not log, print, or export sensitive FMCG operational metrics, unmasked financial data, or credentials into MLflow tracking logs, standard output, or error tracebacks.
 - **Redaction Rule**: If an exception includes sensitive values, replace them with `REDACTED` before logging.
 

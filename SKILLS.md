@@ -76,3 +76,38 @@ You are not just a statistical calculator; you are a business optimizer. All tec
 ## 13. Polars/Pandas Boundary
 - **Polars First:** Use Polars for heavy ETL and feature engineering.
 - **Pandas Boundary:** Convert to Pandas only at model-fitting boundaries when a library requires it.
+
+## 14. Data Governance, Privacy & Security
+- **PII Handling:** Never log raw PII to MLflow or stdout. Apply masking/anonymization before storage or logging.
+- **Data Minimization:** Use only features required for the modeling objective. Avoid collecting unused attributes.
+- **Retention & Access:** Follow dataset retention rules and least-privilege access. Document data sources and owners.
+
+## 15. Reproducibility & Environment Control
+- **Seed Everything:** Set random seeds for NumPy, Python, and model libraries in every script.
+- **Environment Lock:** Maintain a pinned dependency file (requirements.txt or conda env) for reproducible runs.
+- **Run Metadata:** Log git commit hash, data version (DVC), and parameter config with each experiment.
+
+## 16. Data Quality Gates (Pre-Train)
+- **Schema Validation:** Enforce column presence, data types, and acceptable ranges before training.
+- **Integrity Checks:** Detect missingness spikes, negative quantities, invalid dates, and price anomalies.
+- **Drift Baseline:** Store training distribution snapshots for later drift checks.
+
+## 17. Monitoring, Drift & SLA Guardrails
+- **Segment Monitoring:** Track OFR/CLS/WMAPE by segment (top/tail, country, peak vs normal).
+- **Drift Detection:** Monitor input drift (PSI/KS) and performance drift in production.
+- **Guardrails:** Define stop-loss rules and fallback thresholds when service levels drop.
+
+## 18. Deployment, CI/CD & Testing
+- **Automated Tests:** Unit tests for feature functions and integration tests for pipelines.
+- **CI Policy:** Block merges if leakage checks, linting, or schema validation fails.
+- **Rollback Plan:** Always keep a production-safe baseline model for immediate rollback.
+
+## 19. Latency, Cost & Inference Strategy
+- **Latency Budgets:** Define max latency per request and batch windows for large inference jobs.
+- **Caching:** Cache heavy feature computation and reuse for repeated SKU/date queries.
+- **Model Size:** Favor smaller models when the marginal accuracy gain does not justify latency/cost.
+
+## 20. Human-in-the-Loop & Decision Policies
+- **Override Rules:** Provide manual overrides for critical SKUs, promos, and stockout risks.
+- **Policy Layer:** Document thresholds and decision rules separately from model training logic.
+- **Auditability:** Keep decision logs for pricing changes and forecast overrides.
