@@ -38,6 +38,11 @@ htmlcov/
 
 .pre-commit-config.yaml
 
+# Agent instructions (local AI context, not project source)
+AGENTS.md
+SKILLS.md
+RULES.md
+
 mlruns/
 mlflow.db
 artifacts/
