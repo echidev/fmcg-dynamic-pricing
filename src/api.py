@@ -1,33 +1,48 @@
-"""FastAPI serving — DecoupledActuarialXGB single-record inference.
+"""FastAPI serving — DecoupledActuarialXGB via MLflow Model Registry.
 
 Usage:
     uvicorn src.api:app --reload
+
+Environment (from .env):
+    MLFLOW_TRACKING_URI        Wajib diisi
+    AWS_ACCESS_KEY_ID          Wajib untuk akses S3 artifact
+    AWS_SECRET_ACCESS_KEY      Wajib untuk akses S3 artifact
+    AWS_DEFAULT_REGION         Wajib untuk akses S3 artifact
 """
 
-import json
 import logging
-from pathlib import Path
+import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
+import mlflow
 import numpy as np
 import pandas as pd
-import xgboost as xgb
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from src.config import FEATURE_COLS, USE_LOG_TARGET
-
 logger = logging.getLogger("api")
-MODEL_DIR = Path("models/decoupled_actuarial_xgb")
-MEAN_MODEL_PATH = MODEL_DIR / "mean_model.json"
-QUANT_MODEL_PATH = MODEL_DIR / "quant_model.json"
-CONFIG_PATH = MODEL_DIR / "model_config.json"
 
-app = FastAPI(
-    title="Decoupled Actuarial XGBoost Serving API",
-    version="1.0.0",
-    description="Single-record inference for FMCG demand forecasting with actuarial optimization.",
-)
+# ── Bootstrap env ──
+load_dotenv()
+
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
+MLFLOW_REGISTERED_MODEL_NAME = "FMCG_Actuarial_Demand_Forecaster"
+MLFLOW_MODEL_VERSION = "2"
+
+for _key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"):
+    _val = os.getenv(_key)
+    if _val:
+        os.environ[_key] = _val
+
+if not MLFLOW_TRACKING_URI:
+    raise RuntimeError(
+        "MLFLOW_TRACKING_URI tidak ditemukan. Set di file .env "
+        "sebelum menjalankan server."
+    )
+
+# ── Schemas ──
 
 
 class FeaturePayload(BaseModel):
@@ -86,7 +101,6 @@ class FeaturePayload(BaseModel):
     pct_change_7: float = Field(default=0.0)
     discount_depth_pct: float = Field(default=0.0, ge=0.0, le=1.0)
     price_momentum: float = Field(default=1.0, ge=0.0)
-
     margin_multiplier: float = Field(default=1.0, ge=0.5, le=3.0)
     perishability_score: float = Field(default=0.3, ge=0.0, le=1.0)
 
@@ -97,36 +111,39 @@ class PredictResponse(BaseModel):
     risk_status: str
 
 
-# ── Model cache (lazy load) ──
+# ── Model cache (singleton, loaded once via lifespan) ──
 
-_mean_model: Optional[xgb.XGBRegressor] = None
-_quant_model: Optional[xgb.XGBRegressor] = None
-
-
-def _get_models():
-    global _mean_model, _quant_model
-    if _mean_model is not None and _quant_model is not None:
-        return _mean_model, _quant_model
-
-    if not MEAN_MODEL_PATH.exists() or not QUANT_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model artifacts tidak ditemukan di {MODEL_DIR}. "
-            "Jalankan 'python -m src.train' terlebih dahulu."
-        )
-
-    _mean_model = xgb.XGBRegressor()
-    _mean_model.load_model(str(MEAN_MODEL_PATH))
-    _quant_model = xgb.XGBRegressor()
-    _quant_model.load_model(str(QUANT_MODEL_PATH))
-    logger.info("Models loaded from %s", MODEL_DIR)
-    return _mean_model, _quant_model
+_pipeline_model: Optional[mlflow.pyfunc.PyFuncModel] = None
 
 
-def _load_config() -> dict:
-    if CONFIG_PATH.exists():
-        with CONFIG_PATH.open("r") as f:
-            return json.load(f)
-    return {}
+# ── Lifespan ──
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pipeline_model
+    try:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        model_uri = f"models:/{MLFLOW_REGISTERED_MODEL_NAME}/{MLFLOW_MODEL_VERSION}"
+        logger.info("Memuat model dari MLflow Registry: %s", model_uri)
+        _pipeline_model = mlflow.pyfunc.load_model(model_uri)
+        logger.info("Model berhasil dimuat dari MLflow Registry")
+    except Exception as exc:
+        logger.error("Gagal memuat model dari MLflow Registry: %s", exc)
+        _pipeline_model = None
+    yield
+
+
+app = FastAPI(
+    title="Decoupled Actuarial XGBoost — MLflow Registry",
+    version="2.0.0",
+    description=(
+        "Single-record inference for FMCG demand forecasting. "
+        "Model ditarik langsung dari MLflow Model Registry "
+        "(FMCG_Actuarial_Demand_Forecaster / v2)."
+    ),
+    lifespan=lifespan,
+)
 
 
 # ── Endpoints ──
@@ -134,57 +151,94 @@ def _load_config() -> dict:
 
 @app.get("/health")
 def health_check():
-    models_ok = MEAN_MODEL_PATH.exists() and QUANT_MODEL_PATH.exists()
-    return {"status": "healthy" if models_ok else "degraded", "models_loaded": models_ok}
+    ok = _pipeline_model is not None
+    return {
+        "status": "healthy" if ok else "degraded",
+        "registry": MLFLOW_REGISTERED_MODEL_NAME,
+        "version": MLFLOW_MODEL_VERSION,
+        "tracking_uri": MLFLOW_TRACKING_URI,
+    }
 
 
 @app.post("/predict-inventory", response_model=PredictResponse)
 def predict_inventory(payload: FeaturePayload):
+    if _pipeline_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Mesin prediksi offline atau AWS EC2 sedang mati. "
+                "Pastikan MLflow tracking server dapat dijangkau dan "
+                "model FMCG_Actuarial_Demand_Forecaster tersedia."
+            ),
+        )
+
     try:
-        mean_model, quant_model = _get_models()
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        row = payload.model_dump()
+        X = pd.DataFrame([row])
 
-    row = payload.model_dump()
-    margin_multiplier = row.pop("margin_multiplier")
-    perishability_score = row.pop("perishability_score")
+        raw = _pipeline_model.predict(X)
 
-    # Build feature vector in correct order
-    data = {}
-    for col in FEATURE_COLS:
-        data[col] = row.get(col, 0.0)
-    data["stock_code"] = row.get("stock_code", "UNKNOWN")
-    data["country"] = row.get("country", "UNKNOWN")
-    data["avg_price"] = row.get("avg_price", 10.0)
+        expected_demand, recommended_stock, risk_status = _parse_prediction(raw)
 
-    X = pd.DataFrame([data])[FEATURE_COLS]
+        return PredictResponse(
+            expected_demand=round(float(expected_demand), 2),
+            recommended_stock=round(float(recommended_stock), 2),
+            risk_status=str(risk_status),
+        )
 
-    def _pred(model, x):
-        p = model.predict(x)
-        return float(np.maximum(np.expm1(p) if USE_LOG_TARGET else p, 0.0))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Prediksi gagal: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Prediksi gagal: {exc}",
+        )
 
-    expected_demand = _pred(mean_model, X)
-    quantile_demand = _pred(quant_model, X)
 
-    # Dynamic Critical Fractile
-    shortage_penalty = margin_multiplier * (1.0 + 0.3 * perishability_score)
-    max_mr_adj = min(margin_multiplier / 3.0, 1.0)
-    overstock_cost = (1.0 - max_mr_adj) * (1.0 + 0.5 * perishability_score)
-    total_cost = shortage_penalty + overstock_cost + 1e-8
-    critical_fractile = float(np.clip(shortage_penalty / total_cost, 0.2, 0.95))
+# ── Helpers ──
 
-    recommended_stock = expected_demand + (quantile_demand - expected_demand) * critical_fractile
-    recommended_stock = float(max(recommended_stock, 0.0))
 
-    if critical_fractile > 0.8:
-        risk_status = "HIGH"
-    elif critical_fractile > 0.6:
-        risk_status = "MEDIUM"
+def _parse_prediction(raw):
+    """Parse pyfunc predict output menjadi (expected, recommended, risk).
+
+    Mendukung format:
+      - dict  (keys: expected_demand, recommended_stock, risk_status)
+      - DataFrame  (kolom: expected_demand, recommended_stock, risk_status)
+      - numpy array 3+ kolom
+      - numpy array 1 kolom → treat sebagai recommended_stock
+    """
+    if isinstance(raw, dict):
+        return (
+            raw.get("expected_demand", 0.0),
+            raw.get("recommended_stock", 0.0),
+            raw.get("risk_status", "LOW"),
+        )
+
+    if isinstance(raw, pd.DataFrame):
+        row = raw.iloc[0]
+        cols = row.index.tolist()
+        if "expected_demand" in cols:
+            return (
+                row.get("expected_demand", 0.0),
+                row.get("recommended_stock", row.iloc[0]),
+                row.get("risk_status", "LOW"),
+            )
+        arr = row.to_numpy()
+    elif isinstance(raw, (list, tuple)):
+        arr = np.asarray(raw, dtype=float).ravel()
+    elif isinstance(raw, np.ndarray):
+        arr = raw.ravel()
+    elif hasattr(raw, "__iter__"):
+        arr = np.asarray(list(raw), dtype=float).ravel()
     else:
-        risk_status = "LOW"
+        arr = np.atleast_1d(float(raw))
 
-    return PredictResponse(
-        expected_demand=round(expected_demand, 2),
-        recommended_stock=round(recommended_stock, 2),
-        risk_status=risk_status,
-    )
+    if len(arr) >= 3:
+        return float(arr[0]), float(arr[1]), str(arr[2])
+    if len(arr) == 2:
+        return float(arr[0]), float(arr[1]), "LOW"
+    if len(arr) == 1:
+        v = float(arr[0])
+        return v * 0.7, v, "LOW"
+    return 0.0, 0.0, "LOW"
