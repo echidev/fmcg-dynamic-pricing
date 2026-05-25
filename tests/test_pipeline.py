@@ -41,14 +41,15 @@ class TestEndToEndPipeline:
     def test_end_to_end_training(self, synthetic_panel):
         """Training DecoupledActuarialXGB dengan data sintetis -> valid prediction."""
         from src.features import add_calendar_holiday_features, add_holiday_intensity_features
-        from src.features import add_peak_days, add_lag_rolling_features
+        from src.features import add_lag_rolling_features
         from src.model import DecoupledActuarialXGB
         from src.config import FEATURE_COLS, PRICE_COL, TARGET_COL
 
         # Feature engineering
         panel = add_calendar_holiday_features(synthetic_panel)
         panel = add_holiday_intensity_features(panel)
-        panel = add_peak_days(panel)
+        panel["is_peak_day"] = 0
+        panel["is_peak_day"] = panel["is_peak_day"].astype("uint8")
         panel = add_lag_rolling_features(panel)
 
         # Filter rows with NaN from lag

@@ -28,6 +28,7 @@ from src.config import (
     FEATURE_COLS,
     GOLD_DIR,
     GROUP_COLS,
+    HOLIDAY_INTENSITY_CAP,
     MIN_OBS,
     MODEL_PARAMS,
     MODELS_DIR,
@@ -38,6 +39,7 @@ from src.config import (
     TABULAR_PATH,
     TARGET_COL,
 )
+from src.features import compute_holiday_intensity_map
 from src.model import DecoupledActuarialXGB
 
 
@@ -116,15 +118,10 @@ def main():
 
     logger = _setup_logger()
 
-    # ── Load MLflow Tracking URI dari environment variable ──
+    # ── Load MLflow Tracking URI ──
     load_dotenv()
-    tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
-    if tracking_uri is None:
-        raise ValueError(
-            "Environment variable MLFLOW_TRACKING_URI tidak ditemukan. "
-            "Setel di file .env atau sebagai environment variable sebelum menjalankan script."
-        )
-
+    from src.config import MLFLOW_TRACKING_URI as DEFAULT_URI
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", DEFAULT_URI)
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment("FMCG-Actuarial-Optimization")
 
@@ -140,11 +137,15 @@ def main():
         import pandas as pd
         panel = pd.read_parquet(args.tabular_parquet)
 
-    # Peak days
+    # Peak days (full data — final training, tidak ada CV split)
     daily_total = panel.groupby(DATE_COL)[TARGET_COL].sum().sort_values(ascending=False)
     peak_n = max(1, int(len(daily_total) * PEAK_DAYS_PCT))
     peak_set = set(daily_total.head(peak_n).index)
     panel["is_peak_day"] = panel[DATE_COL].isin(peak_set).astype("uint8")
+
+    # Holiday intensity (full data — final training)
+    intensity_map = compute_holiday_intensity_map(panel)
+    panel["holiday_intensity"] = panel["country_code"].map(intensity_map).fillna(1.0).clip(upper=HOLIDAY_INTENSITY_CAP).astype("float32")
 
     # Filter low-obs items
     obs = panel.groupby(GROUP_COLS).size()

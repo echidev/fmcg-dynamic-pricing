@@ -22,7 +22,6 @@ from src.config import (
     FEATURE_COLS,
     GROUP_COLS,
     HOLIDAY_INTENSITY_CAP,
-    PEAK_DAYS_PCT,
     PRICE_COL,
     SILVER_DIR,
     TABULAR_PATH,
@@ -103,45 +102,17 @@ def add_calendar_holiday_features(panel: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════
 
 def add_holiday_intensity_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """Holiday intensity score, days to next holiday, is_holiday_season."""
+    """Calendar-based holiday features (non-leaky).
+    
+    NOTE: holiday_intensity is set to 1.0 as a default placeholder.
+    It MUST be recomputed per-fold from training data only in tune.py
+    via compute_holiday_intensity_map().
+    """
     panel = panel.copy()
 
-    # 1) Holiday intensity: mean(holiday_demand) / mean(pre_holiday_demand) per country
-    # FIX 2: drop_duplicates dengan subset (country_code, date) agar variasi per tanggal terjaga
-    intensity_rows = []
-    hc = panel[panel["is_hari_besar"] == 1][["country_code", DATE_COL, TARGET_COL]].drop_duplicates(subset=["country_code", DATE_COL])
-    if not hc.empty:
-        holiday_demand = hc.groupby("country_code")[TARGET_COL].mean().to_dict()
-        pre_holiday_demand = {}
-        for code in holiday_demand:
-            pr = panel[(panel["country_code"] == code) & (panel["is_pre_hari_besar"] == 1)]
-            pre_holiday_demand[code] = pr[TARGET_COL].mean() if len(pr) > 0 else 1.0
-        for code in holiday_demand:
-            base = pre_holiday_demand.get(code, 1.0)
-            intensity_rows.append({
-                "country_code": code,
-                "holiday_intensity": holiday_demand[code] / base if base > 0 else 1.0,
-            })
-    intensity_df = (
-        pd.DataFrame(intensity_rows)
-        if intensity_rows else pd.DataFrame(columns=["country_code", "holiday_intensity"])
-    )
-    panel = panel.merge(intensity_df, on="country_code", how="left", copy=False)
-    panel["holiday_intensity"] = panel["holiday_intensity"].fillna(1.0).astype("float32")
+    panel["holiday_intensity"] = 1.0
 
-    # Filter country dengan <5 hari libur: set intensity=1.0
-    hc2 = panel[panel["is_hari_besar"] == 1].groupby("country_code").size()
-    low_holiday = hc2[hc2 < 5].index
-    if len(low_holiday) > 0:
-        panel.loc[panel["country_code"].isin(low_holiday), "holiday_intensity"] = 1.0
-
-    # FIX 2: Cap dinaikkan dari 10.0 ke HOLIDAY_INTENSITY_CAP agar tidak flat
-    panel["holiday_intensity"] = panel["holiday_intensity"].clip(upper=HOLIDAY_INTENSITY_CAP)
-
-    del intensity_df, hc, hc2
-    gc.collect()
-
-    # 2) days_to_next_holiday (capped 30)
+    # days_to_next_holiday (capped 30)
     panel = panel.sort_values(["country", DATE_COL], kind="mergesort").reset_index(drop=True)
     hdates = (
         panel[panel["is_hari_besar"] == 1][["country", DATE_COL]]
@@ -184,16 +155,37 @@ def add_holiday_intensity_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  C. Peak Days (1 feature)
+#  C. Holiday Intensity Map (leakage-safe — per-fold)
 # ═══════════════════════════════════════════════════════════════
 
-def add_peak_days(panel: pd.DataFrame) -> pd.DataFrame:
-    """Label top PEAK_DAYS_PCT hari sebagai is_peak_day."""
-    daily_total = panel.groupby(DATE_COL)[TARGET_COL].sum().sort_values(ascending=False)
-    n_peak = max(1, int(len(daily_total) * PEAK_DAYS_PCT))
-    peak_dates = set(daily_total.head(n_peak).index)
-    panel["is_peak_day"] = panel[DATE_COL].isin(peak_dates).astype("uint8")
-    return panel
+def compute_holiday_intensity_map(panel: pd.DataFrame) -> dict:
+    """Hitung holiday intensity hanya dari subset panel (training set).
+    
+    Returns dict mapping country_code -> holiday_intensity value.
+    """
+    hc = panel[panel["is_hari_besar"] == 1][["country_code", DATE_COL, TARGET_COL]].drop_duplicates(subset=["country_code", DATE_COL])
+    if hc.empty:
+        return {}
+
+    holiday_demand = hc.groupby("country_code")[TARGET_COL].mean().to_dict()
+    pre_holiday_demand = {}
+    for code in holiday_demand:
+        pr = panel[(panel["country_code"] == code) & (panel["is_pre_hari_besar"] == 1)]
+        pre_holiday_demand[code] = pr[TARGET_COL].mean() if len(pr) > 0 else 1.0
+
+    holiday_counts = hc.groupby("country_code").size()
+
+    result = {}
+    for code in holiday_demand:
+        base = pre_holiday_demand.get(code, 1.0)
+        intensity = holiday_demand[code] / base if base > 0 else 1.0
+        if holiday_counts.get(code, 0) < 5:
+            intensity = 1.0
+        result[code] = min(intensity, HOLIDAY_INTENSITY_CAP)
+
+    del hc, holiday_demand, pre_holiday_demand, holiday_counts
+    gc.collect()
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -326,12 +318,18 @@ def _write_manifest(manifest_dir: Path, payload: dict) -> Path:
 
 
 def build_tabular_dataframe(panel: pd.DataFrame) -> pd.DataFrame:
-    """Gabung semua feature group jadi satu tabular DataFrame."""
+    """Gabung semua feature group jadi satu tabular DataFrame.
+    
+    NOTE: is_peak_day dan holiday_intensity adalah placeholder di sini.
+    Keduanya WAJIB dihitung ulang per-fold dari training data di tune.py
+    untuk mencegah data leakage temporal.
+    """
     logger = _setup_logger()
     logger.info("Building tabular from panel: rows=%s cols=%s", panel.shape[0], panel.shape[1])
     panel = add_calendar_holiday_features(panel)
     panel = add_holiday_intensity_features(panel)
-    panel = add_peak_days(panel)
+    panel["is_peak_day"] = 0
+    panel["is_peak_day"] = panel["is_peak_day"].astype("uint8")
     panel = add_lag_rolling_features(panel)
     logger.info("Tabular complete: rows=%s cols=%s features=%s", panel.shape[0], panel.shape[1], len(FEATURE_COLS))
     return panel

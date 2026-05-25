@@ -1,86 +1,116 @@
 """Behavioral / directional testing — memvalidasi hubungan ekonomi model.
 
 Prinsip: model harus respect hukum dasar ekonomi (price elasticity).
-Higher price → lower or equal demand.
+Higher price -> lower or equal demand.
 """
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from src.config import FEATURE_COLS, PRICE_COL, TARGET_COL
+from src.model import DecoupledActuarialXGB
+
 
 class TestPriceElasticity:
-    """Test bahwa model menghormati price elasticity of demand."""
+    """Test bahwa DecoupledActuarialXGB menghormati price elasticity."""
 
-    def _create_elasticity_data(self, n=50):
-        """Buat 2 row identik, row2 punya price 50% lebih tinggi."""
-        rng = np.random.default_rng(42)
-        n_feat = 52
-        feat_names = [
-            "day_of_week", "week_of_year", "month", "quarter", "day_of_month",
-            "is_weekend", "is_month_start", "is_month_end",
-            "days_to_month_end", "week_of_month",
-            "is_month_start_window", "is_month_end_window",
-            "is_hari_besar", "is_pre_hari_besar",
-            "holiday_intensity", "days_to_next_holiday",
-            "is_holiday_season", "holiday_x_weekend",
-            "is_peak_day",
-            "demand_lag_1", "demand_lag_2", "demand_lag_7", "demand_lag_14",
-            "demand_lag_21", "demand_lag_28", "demand_lag_35", "demand_lag_56", "demand_lag_84",
-            "days_since_last_sale", "roll_zero_count_14",
-            "roll_max_7", "roll_max_28",
-            "roll_mean_7", "roll_mean_14", "roll_mean_28", "roll_mean_56",
-            "roll_median_7", "roll_median_14", "roll_median_28",
-            "roll_std_7", "roll_std_14", "roll_std_28", "roll_std_56",
-            "roll_max_56", "roll_max_84",
-            "demand_acceleration_3d",
-            "spike_ratio_28", "spike_ratio_56",
-            "pct_change_1", "pct_change_7",
-            "discount_depth_pct", "price_momentum",
-        ]
-
-        # Two identical rows
-        row = rng.random(n_feat)
-        X = pd.DataFrame([row, row.copy()], columns=feat_names).astype("float32")
+    def _make_fake_features(self, n: int, seed: int = 42) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        X = pd.DataFrame(rng.random((n, len(FEATURE_COLS))), columns=FEATURE_COLS).astype("float32")
         X["is_hari_besar"] = 0
         X["is_pre_hari_besar"] = 0
-        X["discount_depth_pct"] = [0.0, 0.5]  # row2 punya diskon 50%
-        X["price_momentum"] = [1.0, 0.5]       # row2: harga turun 50%
-        X["demand_lag_1"] = 10.0
-        X["demand_lag_2"] = 10.0
+        X["is_weekend"] = (X["day_of_week"] > 0.7).astype("float32")
+        X["holiday_x_weekend"] = (X["is_hari_besar"] * X["is_weekend"]).astype("float32")
+        X["is_peak_day"] = 0
+        X["discount_depth_pct"] = rng.random(n).astype("float32")
+        X["price_momentum"] = rng.uniform(0.5, 1.5, n).astype("float32")
+        X["demand_lag_1"] = 5.0
+        X["demand_lag_2"] = 5.0
+        X["days_to_next_holiday"] = rng.integers(0, 30, n).astype("float32")
+        for c in FEATURE_COLS:
+            if X[c].dtype == "float64":
+                X[c] = X[c].astype("float32")
+        return X
 
-        # Training data: small synthetic
-        y_train = np.random.default_rng(42).poisson(10, size=n).astype(float)
-        X_train = pd.DataFrame(
-            np.random.default_rng(42).random((n, n_feat)),
-            columns=feat_names,
-        ).astype("float32")
-        X_train["is_hari_besar"] = 0
-        X_train["demand_lag_1"] = 5.0
-        X_train["demand_lag_2"] = 5.0
-
-        return X, X_train, y_train
-
-    def test_price_elasticity_logic(self, dummy_features):
-        """Harga lebih tinggi → prediksi demand <= prediksi harga rendah.
+    def test_price_elasticity_logic(self):
+        """Harga lebih tinggi -> prediksi demand lebih rendah atau sama.
 
         Menggunakan price_momentum sebagai proxy: row dengan price_momentum
-        lebih rendah (harga turun) harus punya demand lebih tinggi atau sama.
+        lebih rendah (harga turun) harus punya demand lebih tinggi.
         """
-        X, X_train, y_train = self._create_elasticity_data()
-        feature_cols = list(X.columns)
+        rng = np.random.default_rng(42)
+        n_train = 200
 
-        # Train tiny model
-        import xgboost as xgb
-        model = xgb.XGBRegressor(
-            n_estimators=10, max_depth=3, random_state=42,
-            tree_method="hist", objective="reg:squarederror",
+        X_train = self._make_fake_features(n_train)
+        y_train = rng.poisson(lam=10, size=n_train).astype(np.float32)
+
+        # Dua row identik kecuali discount_depth_pct & price_momentum
+        X_test = self._make_fake_features(2, seed=99)
+        X_test["discount_depth_pct"] = [0.0, 0.5]
+        X_test["price_momentum"] = [1.0, 0.5]
+        X_test["demand_lag_1"] = 10.0
+        X_test["demand_lag_2"] = 10.0
+
+        dummy_price = np.array([10.0, 5.0], dtype=np.float32)
+        dummy_keys = [("A", "UK"), ("A", "UK")]
+
+        model = DecoupledActuarialXGB(
+            model_params={
+                "n_estimators": 10, "max_depth": 3,
+                "tree_method": "hist", "random_state": 42, "n_jobs": 1,
+            },
+            quantile_q_target=0.90,
+            shortage_margin_multiplier=1.5,
         )
-        model.fit(X_train[feature_cols].to_numpy(), y_train)
-        preds = model.predict(X[feature_cols].to_numpy())
 
-        # Row1 (no discount) should have demand >= Row2 (50% discount)
-        # Because discount_depth_pct higher → expected demand higher
-        # So pred[1] (discount 0.5) >= pred[0] (discount 0.0) ideally
+        model.fit(X_train, y_train, feature_cols=FEATURE_COLS)
+        preds = model.predict(X_test, dummy_price, dummy_keys)
+
         msg = f"Price elasticity violation: discount row ({preds[1]:.2f}) < no-discount row ({preds[0]:.2f})"
-        assert preds[1] >= preds[0] * 0.5, msg  # Allow 50% tolerance
+        assert preds[1] >= preds[0] * 0.5, msg
+
+    def test_non_negative_predictions(self):
+        """Semua prediksi harus >= 0."""
+        n = 50
+        X = self._make_fake_features(n)
+        y = np.random.default_rng(42).poisson(10, n).astype(np.float32)
+        dummy_price = np.full(n, 10.0, dtype=np.float32)
+        dummy_keys = [("A", "UK")] * n
+
+        model = DecoupledActuarialXGB(
+            model_params={
+                "n_estimators": 5, "max_depth": 2,
+                "tree_method": "hist", "random_state": 42, "n_jobs": 1,
+            },
+            quantile_q_target=0.90,
+            shortage_margin_multiplier=1.5,
+        )
+        model.fit(X, y, feature_cols=FEATURE_COLS)
+        preds = model.predict(X, dummy_price, dummy_keys)
+        assert (preds >= 0).all(), "Negative predictions!"
+
+    def test_predict_actuarial_returns_components(self):
+        """predict_actuarial dengan return_components=True harus return tuple."""
+        n = 50
+        X = self._make_fake_features(n)
+        y = np.random.default_rng(42).poisson(10, n).astype(np.float32)
+        dummy_price = np.full(n, 10.0, dtype=np.float32)
+        dummy_keys = [("A", "UK")] * n
+
+        model = DecoupledActuarialXGB(
+            model_params={
+                "n_estimators": 5, "max_depth": 2,
+                "tree_method": "hist", "random_state": 42, "n_jobs": 1,
+            },
+            quantile_q_target=0.90,
+            shortage_margin_multiplier=1.5,
+        )
+        model.fit(X, y, feature_cols=FEATURE_COLS)
+        result = model.predict_actuarial(X, dummy_price, dummy_keys, return_components=True)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        final_pred, components = result
+        assert "critical_fractile" in components
+        assert "p_mean" in components
+        assert "p_quant" in components

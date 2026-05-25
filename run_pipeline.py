@@ -126,32 +126,5 @@ def main():
     logger.info("Pipeline complete")
 
 
-def _get_best_mlflow_run() -> str | None:
-    """Find the best MLflow run by CLS metric."""
-    try:
-        import mlflow
-        from mlflow.tracking import MlflowClient
-        from src.config import MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT
-
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        client = MlflowClient()
-        experiment = client.get_experiment_by_name(MLFLOW_EXPERIMENT)
-
-        if experiment is None:
-            return None
-
-        # Search runs sorted by metric 'best_cls'
-        runs = mlflow.search_runs(
-            experiment_ids=[experiment.experiment_id],
-            order_by=["metrics.best_cls ASC"],
-            max_results=1,
-        )
-        if runs.empty:
-            return None
-        return runs.iloc[0]["run_id"]
-    except Exception:
-        return None
-
-
 if __name__ == "__main__":
     main()

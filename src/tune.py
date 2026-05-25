@@ -19,16 +19,19 @@ from src.config import (
     DATE_COL,
     FEATURE_COLS,
     GROUP_COLS,
+    HOLIDAY_INTENSITY_CAP,
     MIN_OBS,
     MLFLOW_EXPERIMENT,
     MLFLOW_TRACKING_URI,
     MODEL_PARAMS,
+    PEAK_DAYS_PCT,
     PRICE_COL,
     PROMOTION_THRESHOLDS,
     RANDOM_STATE,
     TABULAR_PATH,
     TARGET_COL,
 )
+from src.features import compute_holiday_intensity_map
 from src.metrics import evaluate_prediction
 from src.model import DecoupledActuarialXGB
 
@@ -107,6 +110,18 @@ def objective(trial, panel, splits, feature_cols):
 
         df_tr = panel.loc[train_mask].reset_index(drop=True)
         df_vl = panel.loc[val_mask].reset_index(drop=True)
+
+        # Compute is_peak_day from training data only (leakage-safe)
+        daily_tr = df_tr.groupby(DATE_COL)[TARGET_COL].sum()
+        n_peak = max(1, int(len(daily_tr) * PEAK_DAYS_PCT))
+        peak_set = set(daily_tr.sort_values(ascending=False).head(n_peak).index)
+        df_tr["is_peak_day"] = df_tr[DATE_COL].isin(peak_set).astype("uint8")
+        df_vl["is_peak_day"] = df_vl[DATE_COL].isin(peak_set).astype("uint8")
+
+        # Compute holiday_intensity from training data only (leakage-safe)
+        intensity_map = compute_holiday_intensity_map(df_tr)
+        df_tr["holiday_intensity"] = df_tr["country_code"].map(intensity_map).fillna(1.0).clip(upper=HOLIDAY_INTENSITY_CAP).astype("float32")
+        df_vl["holiday_intensity"] = df_vl["country_code"].map(intensity_map).fillna(1.0).clip(upper=HOLIDAY_INTENSITY_CAP).astype("float32")
 
         X_tr = df_tr[feature_cols]
         y_tr = df_tr[TARGET_COL].to_numpy(dtype=np.float32, copy=False)
@@ -216,12 +231,6 @@ def main():
         panel = process_silver()
     else:
         panel = load_data(args.tabular_parquet)
-
-    # Peak days on full data
-    daily_total = panel.groupby(DATE_COL)[TARGET_COL].sum().sort_values(ascending=False)
-    peak_n = max(1, int(len(daily_total) * 0.05))
-    peak_set = set(daily_total.head(peak_n).index)
-    panel["is_peak_day"] = panel[DATE_COL].isin(peak_set).astype("uint8")
 
     splits = make_splits(panel[DATE_COL])
     logger.info("Splits=%s panel=%s", len(splits), panel.shape)
