@@ -171,15 +171,17 @@ def main():
             "Max_CLS": metrics["cls"],
         })
 
-        # Log artifact model XGBoost
-        mlflow.xgboost.log_model(
-            xgb_model=model.model_mean_,
-            artifact_path="mean_model",
-            registered_model_name="FMCG_Actuarial_Demand_Forecaster",
-        )
-        mlflow.xgboost.log_model(
-            xgb_model=model.model_quant_,
-            artifact_path="quant_model",
+        # Log sebagai unified PyFunc pipeline (satu registered model)
+        from src.model_wrapper import DecoupledActuarialWrapper
+
+        mlflow.pyfunc.log_model(
+            artifact_path="model",
+            python_model=DecoupledActuarialWrapper(),
+            artifacts={
+                "mean_model": str(Path(args.output_dir) / "mean_model.json"),
+                "quant_model": str(Path(args.output_dir) / "quant_model.json"),
+                "config": str(Path(args.output_dir) / "model_config.json"),
+            },
             registered_model_name="FMCG_Actuarial_Demand_Forecaster",
         )
 
