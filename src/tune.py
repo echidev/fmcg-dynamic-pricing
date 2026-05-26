@@ -16,8 +16,11 @@ import pandas as pd
 from optuna.pruners import MedianPruner
 
 from src.config import (
+    CUTOFF_DATE,
+    DATASET_VERSION,
     DATE_COL,
     FEATURE_COLS,
+    FEATURE_SET_ID,
     GROUP_COLS,
     HOLIDAY_INTENSITY_CAP,
     MIN_OBS,
@@ -30,6 +33,9 @@ from src.config import (
     RANDOM_STATE,
     TABULAR_PATH,
     TARGET_COL,
+    get_git_commit,
+    log_env_snapshot,
+    set_global_seed,
 )
 from src.features import compute_holiday_intensity_map
 from src.metrics import evaluate_prediction
@@ -48,9 +54,14 @@ def _setup_logger() -> logging.Logger:
     return logger
 
 
-def make_splits(dates, horizon=30, n_splits=3, min_train=180):
+def make_splits(dates, horizon=30, n_splits=3, min_train=180, cutoff_date=None):
     """Time-series expanding window splits."""
     dates = np.array(sorted(pd.to_datetime(dates).unique()))
+    if cutoff_date is not None:
+        cutoff = pd.Timestamp(cutoff_date)
+        dates = dates[dates <= cutoff]
+        if len(dates) == 0:
+            raise ValueError(f"cutoff_date {cutoff_date} menghasilkan 0 unique dates")
     total = len(dates)
     splits = []
     for i in range(n_splits):
@@ -220,6 +231,8 @@ def main():
     parser.add_argument("--seed", type=int, default=RANDOM_STATE)
     args = parser.parse_args()
 
+    set_global_seed(args.seed)
+
     logger = _setup_logger()
     logger.info("DecoupledActuarialXGB — Optuna Tuning")
 
@@ -232,8 +245,8 @@ def main():
     else:
         panel = load_data(args.tabular_parquet)
 
-    splits = make_splits(panel[DATE_COL])
-    logger.info("Splits=%s panel=%s", len(splits), panel.shape)
+    splits = make_splits(panel[DATE_COL], cutoff_date=CUTOFF_DATE)
+    logger.info("Splits=%s panel=%s cutoff=%s", len(splits), panel.shape, CUTOFF_DATE)
 
     # Filter low-obs items
     obs = panel.groupby(GROUP_COLS).size()
@@ -245,6 +258,12 @@ def main():
 
     run_name = f"decoupled_actuarial_optuna_{args.trials}t_{args.seed}s"
     with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_param("git_commit", get_git_commit())
+        mlflow.log_param("dataset_version", DATASET_VERSION)
+        mlflow.log_param("feature_set_id", FEATURE_SET_ID)
+        mlflow.log_param("cutoff_date", CUTOFF_DATE)
+        log_env_snapshot(mlflow)
+
         study = run_optuna(panel, splits, FEATURE_COLS, args.trials, args.seed)
 
         mlflow.log_params(study.best_params)

@@ -21,8 +21,11 @@ from src.config import (
     GROUP_COLS,
     NON_PRODUCT_CODES,
     RAW_PATH,
+    REQUIRED_COLS_SILVER,
     TARGET_COL,
     USECOLS,
+    set_global_seed,
+    validate_schema,
 )
 
 
@@ -146,6 +149,8 @@ def process_bronze(input_path: Path = None, output_path: Path = None) -> pd.Data
     del daily
     gc.collect()
 
+    validate_schema(panel, REQUIRED_COLS_SILVER, "silver_panel")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(output_path, index=False)
     logger.info("Silver: panel ditulis ke %s rows=%s cols=%s",
@@ -209,5 +214,6 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    set_global_seed()
     args = parse_args()
     run_data_prep(args.input, args.output)

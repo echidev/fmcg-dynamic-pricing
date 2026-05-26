@@ -9,6 +9,7 @@ Menggantikan TwinXGBBoosted sepenuhnya.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -212,3 +213,22 @@ class DecoupledActuarialXGB:
             "margin_ratio_high": self.margin_ratio_high,
             "margin_ratio_low": self.margin_ratio_low,
         }
+
+
+def export_to_onnx(
+    model: DecoupledActuarialXGB,
+    output_path: Path,
+    feature_cols: list,
+) -> None:
+    """Export mean XGBoost model ke ONNX format."""
+    import numpy as np
+    dummy_x = np.zeros((1, len(feature_cols)), dtype=np.float32)
+
+    from onnxmltools import convert_xgboost
+    from onnxconverter_common import FloatTensorType
+
+    initial_types = [("input", FloatTensorType([None, len(feature_cols)]))]
+    onnx_model = convert_xgboost(model.model_mean_, initial_types=initial_types)
+
+    import onnx
+    onnx.save(onnx_model, str(output_path))

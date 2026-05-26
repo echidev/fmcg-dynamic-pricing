@@ -36,8 +36,8 @@ logs/
 htmlcov/
 .coverage
 .pytest_cache/
+.ruff_cache/
 
-.pre-commit-config.yaml
 
 # Agent instructions (local AI context, not project source)
 AGENTS.md
@@ -58,3 +58,4 @@ catboost_info/
 *.pt
 *.pth
 *.ubj
+"http:/forcaster.duckdns.org:5000"/

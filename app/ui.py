@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 from typing import Any
 
 import requests
 import streamlit as st
 
-API_URL = "http://localhost:8000"
+API_URL = os.getenv("FMCG_API_URL", "http://localhost:8000")
 
 COUNTRIES = [
     "United Kingdom", "Germany", "France", "EIRE", "Netherlands",
@@ -35,10 +36,11 @@ def _build_preview_payload(
     is_public_holiday: bool,
     is_peak_day: bool,
     is_promo: bool,
-    margin_multiplier: float,
-    perishability_score: float,
 ) -> dict[str, Any]:
     dow = forecast_date.weekday()
+    # Estimasi demand baseline dari price untuk mengisi lag features
+    # Catatan: Untuk production, lag features harus berasal dari historical data nyata
+    base_est = max(avg_price * 0.8, 1.0)
     payload: dict[str, Any] = {
         "stock_code": stock_code,
         "country": country,
@@ -62,41 +64,39 @@ def _build_preview_payload(
         "days_to_next_holiday": 0 if is_public_holiday else 30,
         "is_holiday_season": 1 if is_public_holiday else 0,
         "holiday_x_weekend": 1 if (is_public_holiday and dow >= 5) else 0,
-        "demand_lag_1": 0.0,
-        "demand_lag_2": 0.0,
-        "demand_lag_7": 0.0,
-        "demand_lag_14": 0.0,
-        "demand_lag_21": 0.0,
-        "demand_lag_28": 0.0,
-        "demand_lag_35": 0.0,
-        "demand_lag_56": 0.0,
-        "demand_lag_84": 0.0,
-        "days_since_last_sale": 0,
-        "roll_zero_count_14": 0.0,
-        "roll_max_7": 0.0,
-        "roll_max_28": 0.0,
-        "roll_mean_7": 0.0,
-        "roll_mean_14": 0.0,
-        "roll_mean_28": 0.0,
-        "roll_mean_56": 0.0,
-        "roll_median_7": 0.0,
-        "roll_median_14": 0.0,
-        "roll_median_28": 0.0,
-        "roll_std_7": 0.0,
-        "roll_std_14": 0.0,
-        "roll_std_28": 0.0,
-        "roll_std_56": 0.0,
-        "roll_max_56": 0.0,
-        "roll_max_84": 0.0,
-        "demand_acceleration_3d": 0.0,
-        "spike_ratio_28": 0.0,
-        "spike_ratio_56": 0.0,
+        "demand_lag_1": base_est,
+        "demand_lag_2": base_est * 0.9,
+        "demand_lag_7": base_est * 0.85,
+        "demand_lag_14": base_est * 0.8,
+        "demand_lag_21": base_est * 0.75,
+        "demand_lag_28": base_est * 0.7,
+        "demand_lag_35": base_est * 0.65,
+        "demand_lag_56": base_est * 0.5,
+        "demand_lag_84": base_est * 0.3,
+        "days_since_last_sale": 1,
+        "roll_zero_count_14": 2.0,
+        "roll_max_7": base_est * 1.2,
+        "roll_max_28": base_est * 1.5,
+        "roll_mean_7": base_est * 0.9,
+        "roll_mean_14": base_est * 0.85,
+        "roll_mean_28": base_est * 0.8,
+        "roll_mean_56": base_est * 0.7,
+        "roll_median_7": base_est * 0.85,
+        "roll_median_14": base_est * 0.8,
+        "roll_median_28": base_est * 0.75,
+        "roll_std_7": base_est * 0.3,
+        "roll_std_14": base_est * 0.35,
+        "roll_std_28": base_est * 0.4,
+        "roll_std_56": base_est * 0.45,
+        "roll_max_56": base_est * 1.8,
+        "roll_max_84": base_est * 2.0,
+        "demand_acceleration_3d": 1.0,
+        "spike_ratio_28": 1.5,
+        "spike_ratio_56": 2.0,
         "pct_change_1": 0.0,
         "pct_change_7": 0.0,
         "discount_depth_pct": 0.15 if is_promo else 0.0,
         "price_momentum": 0.85 if is_promo else 1.0,
-        "margin_multiplier": margin_multiplier,
-        "perishability_score": perishability_score,
     }
     return payload
 
@@ -218,23 +218,6 @@ with st.sidebar:
         step=0.5,
         format="%.2f",
     )
-    margin_multiplier = st.slider(
-        "Margin Multiplier",
-        min_value=0.5,
-        max_value=3.0,
-        value=1.5,
-        step=0.05,
-        help="Cost of Shortage multiplier. Higher = more aggressive stocking.",
-    )
-    perishability_score = st.slider(
-        "Perishability Score",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.3,
-        step=0.05,
-        help="Higher = faster spoilage. Suppresses overstock.",
-    )
-
     st.divider()
 
     st.markdown("##### Calendar Events")
@@ -301,8 +284,6 @@ with col_input:
             is_public_holiday=is_public_holiday,
             is_peak_day=is_peak_day,
             is_promo=is_promo,
-            margin_multiplier=margin_multiplier,
-            perishability_score=perishability_score,
         )
         st.code(
             json.dumps(preview_payload, indent=2, default=str),
@@ -330,8 +311,6 @@ with col_result:
             is_public_holiday=is_public_holiday,
             is_peak_day=is_peak_day,
             is_promo=is_promo,
-            margin_multiplier=margin_multiplier,
-            perishability_score=perishability_score,
         )
 
         with st.spinner("Running actuarial simulation..."):

@@ -62,5 +62,7 @@ def dummy_features(dummy_data):
     for c in ["demand_lag_1", "demand_lag_2", "demand_lag_7"]:
         X[c] = 1.0
     X["discount_depth_pct"] = rng.random(n).astype("float32")
-    X["country_code"] = "GB"
+    X["country_code"] = dummy_data["country"].map(
+        {"UK": "GB", "US": "US"}
+    ).fillna("GB")
     return X

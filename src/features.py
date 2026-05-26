@@ -26,6 +26,7 @@ from src.config import (
     SILVER_DIR,
     TABULAR_PATH,
     TARGET_COL,
+    set_global_seed,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -350,5 +351,6 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    set_global_seed()
     args = parse_args()
     run_features(args.input, args.output_tabular)

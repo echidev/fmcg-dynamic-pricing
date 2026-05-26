@@ -59,8 +59,6 @@ class FeaturePayload(BaseModel):
     pct_change_7: float = Field(default=0.0)
     discount_depth_pct: float = Field(default=0.0, ge=0.0, le=1.0)
     price_momentum: float = Field(default=1.0, ge=0.0)
-    margin_multiplier: float = Field(default=1.0, ge=0.5, le=3.0)
-    perishability_score: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class PredictResponse(BaseModel):

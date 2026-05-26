@@ -24,8 +24,11 @@ import mlflow
 import numpy as np
 
 from src.config import (
+    CUTOFF_DATE,
+    DATASET_VERSION,
     DATE_COL,
     FEATURE_COLS,
+    FEATURE_SET_ID,
     GOLD_DIR,
     GROUP_COLS,
     HOLIDAY_INTENSITY_CAP,
@@ -38,9 +41,12 @@ from src.config import (
     SHORTAGE_MARGIN_MULTIPLIER,
     TABULAR_PATH,
     TARGET_COL,
+    get_git_commit,
+    log_env_snapshot,
+    set_global_seed,
 )
 from src.features import compute_holiday_intensity_map
-from src.model import DecoupledActuarialXGB
+from src.model import DecoupledActuarialXGB, export_to_onnx
 
 
 def _setup_logger() -> logging.Logger:
@@ -114,7 +120,10 @@ def main():
     parser.add_argument("--input", type=str, default=str(GOLD_DIR / "online_retail_daily_product_tabular.parquet"))
     parser.add_argument("--tabular-parquet", type=str, default=str(TABULAR_PATH))
     parser.add_argument("--output-dir", type=str, default=str(MODELS_DIR / "decoupled_actuarial_xgb"))
+    parser.add_argument("--skip-onnx", action="store_true", help="Skip ONNX export")
     args = parser.parse_args()
+
+    set_global_seed()
 
     logger = _setup_logger()
 
@@ -154,6 +163,12 @@ def main():
 
     # ── MLflow Run ──
     with mlflow.start_run(run_name="Production_Tuned_Model") as run:
+        mlflow.log_param("git_commit", get_git_commit())
+        mlflow.log_param("dataset_version", DATASET_VERSION)
+        mlflow.log_param("feature_set_id", FEATURE_SET_ID)
+        mlflow.log_param("cutoff_date", CUTOFF_DATE)
+        log_env_snapshot(mlflow)
+
         model, metrics = train(panel, Path(args.output_dir))
 
         # Log parameter pemenang dari Optuna tuning
@@ -187,6 +202,18 @@ def main():
 
         mlflow.set_tag("model", "decoupled-actuarial-xgb")
         mlflow.set_tag("stage", "production")
+
+    # ── ONNX Export ──
+    if not args.skip_onnx:
+        try:
+            onnx_path = Path(args.output_dir) / "model.onnx"
+            export_to_onnx(model, onnx_path, FEATURE_COLS)
+            logger.info("ONNX model exported to %s", onnx_path)
+            mlflow.log_artifact(str(onnx_path))
+        except ImportError:
+            logger.info("onnxmltools tidak tersedia, skip ONNX export")
+        except Exception as e:
+            logger.warning("ONNX export gagal: %s", e)
 
     logger.info("MLflow Run ID: %s", run.info.run_id)
     logger.info("Pelatihan selesai. Model di: %s", args.output_dir)

@@ -2,8 +2,13 @@
 Single source of truth untuk semua konstanta, parameter, dan feature list.
 """
 
+import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 # ── Paths ──
@@ -143,6 +148,63 @@ def load_config() -> dict:
 
 
 _CFG = load_config()
+
+# ── Config-driven variables ──
+DATASET_VERSION = str(_CFG.get("dataset_version", "online_retail_v1"))
+FEATURE_SET_ID = str(_CFG.get("feature_set_id", "fmcg_features_v52"))
+CUTOFF_DATE = str(_CFG.get("cutoff_date", "2011-12-09"))
+
+
+def get_git_commit() -> str:
+    """Ambil git commit hash dari HEAD."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=Path(__file__).resolve().parent,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def set_global_seed(seed: int = 42) -> None:
+    """Set global random seed untuk reproducibility."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+REQUIRED_COLS_SILVER = {
+    "stock_code", "country", "date", "demand_qty",
+    "revenue", "avg_price", "num_invoices",
+}
+
+
+def validate_schema(df: "pd.DataFrame", required_cols: set, name: str = "dataframe") -> None:
+    """Validasi kolom wajib ada di DataFrame."""
+    import pandas as pd
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"{name}: Missing required columns: {missing}")
+    logger = logging.getLogger("schema")
+    logger.info("%s: schema OK — %d columns, %d rows", name, len(df.columns), len(df))
+
+
+def log_env_snapshot(mlflow) -> None:
+    """Log environment metadata dan pip freeze ke MLflow."""
+    mlflow.log_param("python_version", sys.version.replace("\n", " "))
+    mlflow.log_param("os_platform", sys.platform)
+    try:
+        pip_freeze = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze", "--no-color"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        mlflow.log_text(pip_freeze, "pip_freeze.txt")
+    except Exception:
+        mlflow.log_text("pip freeze failed", "pip_freeze.txt")
+
 
 # ── Data quality ──
 MIN_OBS = 60

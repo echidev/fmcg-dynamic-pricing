@@ -48,7 +48,7 @@ def load_model(model_dir: Path) -> dict:
 
 
 def predict(model_dict: dict, df: pd.DataFrame) -> np.ndarray:
-    """Predict demand menggunakan Decoupled Actuarial.
+    """Predict demand menggunakan DecoupledActuarialXGB.
 
     Args:
         model_dict: Output dari load_model().
@@ -57,42 +57,28 @@ def predict(model_dict: dict, df: pd.DataFrame) -> np.ndarray:
     Returns:
         Array prediksi demand_qty.
     """
-    X = df[FEATURE_COLS]
-    price = df[PRICE_COL].to_numpy(dtype=np.float32, copy=False)
+    from src.model import DecoupledActuarialXGB
 
     config = model_dict["config"]
-    use_log = config.get("use_log_target", True)
+    model = DecoupledActuarialXGB(
+        model_params=config.get("model_params", {}),
+        quantile_q_target=config.get("quantile_q_target", 0.9799),
+        shortage_margin_multiplier=config.get("shortage_margin_multiplier", 2.2847),
+        use_log_target=config.get("use_log_target", True),
+    )
+    model.model_mean_ = model_dict["mean_model"]
+    model.model_quant_ = model_dict["quant_model"]
+    model.feature_cols_ = config.get("feature_cols", FEATURE_COLS)
+    model._fitted = True
 
-    def _pred(model, x):
-        p = model.predict(x)
-        return np.maximum(np.expm1(p) if use_log else p, 0)
+    X = df[FEATURE_COLS]
+    price = df[PRICE_COL].to_numpy(dtype=np.float32, copy=False)
+    keys = list(zip(
+        df.get("stock_code", pd.Series([""] * len(df))).to_numpy(),
+        df.get("country", pd.Series([""] * len(df))).to_numpy(),
+    ))
 
-    p_mean = _pred(model_dict["mean_model"], X)
-    p_quant = _pred(model_dict["quant_model"], X)
-
-    # Actuarial layer
-    median_price = float(np.median(price[price > 0])) if (price > 0).any() else 1.0
-    item_price = np.where(price > 0, price, median_price)
-
-    margin_ratio_high = config.get("margin_ratio_high", 1.5)
-    margin_ratio_low = config.get("margin_ratio_low", 0.7)
-    margin_ratio = np.where(item_price > median_price, margin_ratio_high, margin_ratio_low)
-    shelf_life_perishable = (item_price < float(np.mean(item_price))).astype(float)
-
-    smm = config.get("shortage_margin_multiplier", 2.2847)
-    shortage_penalty = margin_ratio * (1.0 + 0.3 * shelf_life_perishable) * smm
-
-    spoilage_penalty = 0.5 * shelf_life_perishable
-    max_mr = max(margin_ratio.max(), 1e-8)
-    overstock_cost = (1.0 - margin_ratio / max_mr) * (1.0 + spoilage_penalty)
-
-    total_cost = shortage_penalty + overstock_cost + 1e-8
-    critical_fractile = np.clip(shortage_penalty / total_cost, 0.2, 0.95)
-
-    final_pred = p_mean + (p_quant - p_mean) * critical_fractile
-    final_pred = np.maximum(final_pred, 0)
-
-    return final_pred
+    return model.predict(X, price, keys)
 
 
 def main():
@@ -101,11 +87,22 @@ def main():
     parser.add_argument("--output", type=str, default="predictions.csv")
     parser.add_argument("--model-dir", type=str, default=str(MODELS_DIR / "decoupled_actuarial_xgb"))
     parser.add_argument("--format", type=str, choices=["csv", "parquet"], default="csv")
+    parser.add_argument("--from-registry", action="store_true", help="Load model from MLflow Model Registry")
+    parser.add_argument("--model-uri", type=str, default="models:/FMCG_Actuarial_Demand_Forecaster/latest", help="MLflow model URI (default: latest from registry)")
     args = parser.parse_args()
 
     logger = _setup_logger()
-    logger.info("Loading model from %s", args.model_dir)
-    model_dict = load_model(Path(args.model_dir))
+
+    if args.from_registry:
+        import mlflow
+        logger.info("Loading model from MLflow Registry: %s", args.model_uri)
+        pyfunc_model = mlflow.pyfunc.load_model(args.model_uri)
+        logger.info("Model loaded from MLflow Registry")
+        # For registry mode, we need to handle differently
+        logger.info("Registry mode: output will use PyFunc schema (expected_demand, recommended_stock, risk_status)")
+    else:
+        logger.info("Loading model from %s", args.model_dir)
+        model_dict = load_model(Path(args.model_dir))
 
     logger.info("Loading data from %s", args.input)
     input_path = Path(args.input)
@@ -117,21 +114,27 @@ def main():
     logger.info("Data shape: %s", df.shape)
     logger.info("Predicting...")
 
-    pred = predict(model_dict, df)
-
-    df["forecast"] = pred
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.format == "parquet":
-        df.to_parquet(output_path.with_suffix(".parquet"), index=False)
-        logger.info("Predictions saved to %s", output_path.with_suffix(".parquet"))
+    if args.from_registry:
+        result_df = pyfunc_model.predict(df)
+        result_df.to_csv(output_path, index=False)
+        logger.info("Predictions (registry schema) saved to %s", output_path)
+        logger.info("Columns: %s", list(result_df.columns))
     else:
-        df.to_csv(output_path, index=False)
-        logger.info("Predictions saved to %s", output_path)
+        pred = predict(model_dict, df)
+        df["forecast"] = pred
 
-    logger.info("Zero rate: %.1f%%", (pred == 0).mean() * 100)
-    logger.info("Mean forecast: %.2f", pred.mean())
+        if args.format == "parquet":
+            df.to_parquet(output_path.with_suffix(".parquet"), index=False)
+            logger.info("Predictions saved to %s", output_path.with_suffix(".parquet"))
+        else:
+            df.to_csv(output_path, index=False)
+            logger.info("Predictions saved to %s", output_path)
+
+        logger.info("Zero rate: %.1f%%", (pred == 0).mean() * 100)
+        logger.info("Mean forecast: %.2f", pred.mean())
 
     del df, pred
     gc.collect()
